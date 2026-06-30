@@ -1,0 +1,36 @@
+[package]
+name = "ledger"
+version = "0.1.0"
+edition = "2021"
+description = "Ledger — one deployable hosting the HOLDFAST data surfaces (events / jobs) behind a Host-based vhost demux, served on BOTH the events port (:9150) and the jobs port (:9160) so the existing internal addresses keep working. Each surface keeps its own database, routes, subdomain and background work; this binary just composes the two library crates so the estate runs one container instead of two. Ark (backup god-credential) is intentionally NOT included."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "ledger"
+path = "src/main.rs"
+
+[dependencies]
+# The two data surfaces, vendored as path-dep library crates and reused VERBATIM (their code,
+# schemas, routes, templates and tests are unchanged). Ledger only adds the vhost demux + dual
+# listener, so each surface behaves exactly as its standalone service did — Delta still owns its
+# event log at DELTA_DATABASE_URL and Tempo its scheduler DB at TEMPO_DATABASE_URL, with Tempo's
+# background cron/heartbeat loop and Klaxon notify wiring preserved.
+delta = { path = "crates/delta" }
+tempo = { path = "crates/tempo" }
+
+# HTTP framework — the outer Host-demux router + the per-surface routers returned by each crate's
+# `app()`. Same axum the surfaces use.
+axum = "0.8"
+# Async runtime: connect/migrate the two Postgres stores at startup, spawn Tempo's scheduler, bind
+# BOTH listeners, then serve. `net` backs the dependency-free `healthcheck` subcommand's loopback
+# probe; `time` backs Tempo's scheduler tick loop.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
+# `ServiceExt::oneshot` drives the chosen per-surface Router for one request inside the demux.
+tower = { version = "0.5", features = ["util"] }
+# Tempo's `AppState.http` is a `reqwest::Client` (cron target fires + Klaxon notify). The standalone
+# crate builds it with a private helper, so Ledger rebuilds an identical client here. rustls only
+# (NO OpenSSL) — default-features off keeps the binary glibc-only, matching the estate posture.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Structured logging (shared with the surfaces).
+tracing = "0.1"
+tracing-subscriber = "0.3"
