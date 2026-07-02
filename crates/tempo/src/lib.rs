@@ -61,6 +61,7 @@ pub fn app(state: AppState) -> Router {
         .route("/", get(handlers::console::index))
         .route("/api/jobs", post(handlers::console::save_job))
         .route("/api/jobs/{id}/toggle", post(handlers::console::toggle_job))
+        .route("/api/runs/{id}/replay", post(handlers::console::replay_run))
         // --- public dead-man heartbeat (own capability-token auth) ---
         .route("/ping/{token}", get(handlers::ping::ping))
         .with_state(state)
@@ -118,7 +119,9 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
 
     match &config.klaxon {
         Some(k) => tracing::info!(url = %k.url, "klaxon notify enabled"),
-        None => tracing::info!("klaxon notify disabled (KLAXON_URL/_INGEST_TOKEN/_NOTIFY_EMAIL unset)"),
+        None => {
+            tracing::info!("klaxon notify disabled (KLAXON_URL/_INGEST_TOKEN/_NOTIFY_EMAIL unset)")
+        }
     }
 
     Ok(AppState {

@@ -10,9 +10,10 @@
 
 use std::collections::HashMap;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
+use serde::Deserialize;
 
 use crate::auth;
 use crate::config::{STREAM_LIST_LIMIT, TAIL_LIMIT};
@@ -22,8 +23,28 @@ use crate::AppState;
 
 /// Payload preview length on the console tail.
 const PAYLOAD_PREVIEW: usize = 80;
+/// Console query page size cap.
+const QUERY_LIMIT_MAX: i64 = 200;
 
-pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
+#[derive(Debug, Deserialize)]
+pub struct IndexQuery {
+    #[serde(default)]
+    pub stream: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub contains: Option<String>,
+    #[serde(default)]
+    pub after: Option<i64>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+pub async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<IndexQuery>,
+) -> Response {
     let email = auth::operator_email(&headers);
 
     let streams = state.store.list_streams(STREAM_LIST_LIMIT).await;
@@ -50,6 +71,7 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Respons
         cursors.len(),
         max_lag,
     ));
+    body.push_str(&render_event_query(&state, &q).await);
 
     // Per-stream cards with the tail.
     body.push_str("<section class=\"card\"><div class=\"card__head\"><h2>Streams</h2></div>");
@@ -83,7 +105,11 @@ fn render_header() -> String {
 }
 
 fn render_stats(events: i64, streams: usize, consumers: usize, max_lag: i64) -> String {
-    let lag_class = if max_lag > 0 { "stat__val--warn" } else { "stat__val--ok" };
+    let lag_class = if max_lag > 0 {
+        "stat__val--warn"
+    } else {
+        "stat__val--ok"
+    };
     format!(
         r#"<div class="stat-grid">
   <div class="stat"><div class="stat__num">{events}</div><div class="stat__label">Events</div></div>
@@ -91,6 +117,119 @@ fn render_stats(events: i64, streams: usize, consumers: usize, max_lag: i64) -> 
   <div class="stat"><div class="stat__num">{consumers}</div><div class="stat__label">Cursors</div></div>
   <div class="stat"><div class="stat__num {lag_class}">{max_lag}</div><div class="stat__label">Max lag</div></div>
 </div>"#,
+    )
+}
+
+async fn render_event_query(state: &AppState, q: &IndexQuery) -> String {
+    let stream = q.stream.as_deref().unwrap_or_default().trim();
+    let key = q.key.as_deref().unwrap_or_default().trim();
+    let contains = q.contains.as_deref().unwrap_or_default().trim();
+    let after = q.after.unwrap_or(0).max(0);
+    let limit = q.limit.unwrap_or(TAIL_LIMIT).max(1).min(QUERY_LIMIT_MAX);
+
+    let form = render_event_query_form(stream, key, contains, after, limit);
+    let has_query =
+        !stream.is_empty() || !key.is_empty() || !contains.is_empty() || q.after.is_some();
+    let results = if has_query {
+        let events = state
+            .store
+            .query_events(stream, key, contains, after, limit)
+            .await;
+        render_event_query_results(&events)
+    } else {
+        "<div class=\"empty\">Enter a stream, key, payload fragment, or offset to query events.</div>"
+            .to_string()
+    };
+
+    format!(
+        r#"<section class="card">
+  <div class="card__head"><h2>Event query</h2></div>
+  <div class="card__body">{form}</div>
+  <div class="card__body--list">{results}</div>
+</section>"#,
+        form = form,
+        results = results,
+    )
+}
+
+fn render_event_query_form(
+    stream: &str,
+    key: &str,
+    contains: &str,
+    after: i64,
+    limit: i64,
+) -> String {
+    format!(
+        r#"<form class="query-form" method="get" action="/">
+  <div class="field">
+    <label for="stream">Stream</label>
+    <input type="text" id="stream" name="stream" maxlength="120" autocomplete="off" value="{stream}">
+  </div>
+  <div class="field">
+    <label for="key">Key</label>
+    <input type="text" id="key" name="key" maxlength="120" autocomplete="off" value="{key}">
+  </div>
+  <div class="field">
+    <label for="contains">Payload contains</label>
+    <input type="search" id="contains" name="contains" maxlength="200" autocomplete="off" value="{contains}">
+  </div>
+  <div class="field">
+    <label for="after">After seq</label>
+    <input type="number" id="after" name="after" min="0" value="{after}">
+  </div>
+  <div class="field">
+    <label for="limit">Limit</label>
+    <input type="number" id="limit" name="limit" min="1" max="{max}" value="{limit}">
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" type="submit">Query</button>
+    <a class="btn btn-ghost" href="/">Reset</a>
+  </div>
+</form>"#,
+        stream = esc(stream),
+        key = esc(key),
+        contains = esc(contains),
+        after = after,
+        limit = limit,
+        max = QUERY_LIMIT_MAX,
+    )
+}
+
+fn render_event_query_results(events: &[Event]) -> String {
+    if events.is_empty() {
+        return "<div class=\"log-empty\">No matching events.</div>".to_string();
+    }
+    let rows = events
+        .iter()
+        .map(|e| {
+            let key = if e.key.is_empty() {
+                "<span class=\"muted\">—</span>".to_string()
+            } else {
+                format!("<code>{}</code>", esc(&truncate(&e.key, 32)))
+            };
+            format!(
+                r#"<tr>
+  <td class="seq">{seq}</td>
+  <td class="stream-cell"><code>{stream}</code></td>
+  <td class="key">{key}</td>
+  <td class="payload">{payload}</td>
+  <td class="when">{when}</td>
+</tr>"#,
+                seq = e.seq,
+                stream = esc(&e.stream),
+                key = key,
+                payload = esc(&truncate(&e.payload, PAYLOAD_PREVIEW)),
+                when = esc(&fmt_ts(e.created_at)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<table class="log-table">
+  <thead><tr><th>Seq</th><th>Stream</th><th>Key</th><th>Payload</th><th>When</th></tr></thead>
+  <tbody>{rows}</tbody>
+</table>"#,
+        rows = rows,
     )
 }
 

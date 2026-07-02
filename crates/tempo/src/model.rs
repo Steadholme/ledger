@@ -17,6 +17,13 @@ pub const STATUS_FAIL: &str = "fail";
 pub const STATUS_DOWN: &str = "down";
 /// Run status / job status: a previously-down heartbeat started beating again.
 pub const STATUS_UP: &str = "up";
+/// Run status: all retry attempts for a cron fire were exhausted; the run is in the DLQ.
+pub const STATUS_DLQ: &str = "dlq";
+
+/// Default number of attempts for a cron fire before it is dead-lettered.
+pub const DEFAULT_MAX_ATTEMPTS: i64 = 3;
+/// Default delay before a failed cron fire is retried by the scheduler.
+pub const DEFAULT_RETRY_DELAY_SECS: i64 = 30;
 
 /// A scheduled job (maps 1:1 to a `jobs` row). For `kind = cron` the `schedule` + `target_url`
 /// drive the firing; for `kind = heartbeat` the `grace_secs` window drives the dead-man check and a
@@ -59,6 +66,25 @@ pub struct Run {
     pub started_at: i64,
     pub status: String,
     pub detail: String,
+}
+
+/// One queued retry for a failed cron run. The row is durable so a restart does not lose retry work.
+#[derive(Clone, Debug)]
+pub struct Retry {
+    pub id: String,
+    pub job_id: String,
+    pub source_run_id: String,
+    pub attempt: i64,
+    pub max_attempts: i64,
+    pub due_at: i64,
+    pub created_at: i64,
+}
+
+/// One page of run history for the console.
+#[derive(Clone, Debug)]
+pub struct RunPage {
+    pub runs: Vec<Run>,
+    pub total: i64,
 }
 
 /// A dead-man heartbeat (maps 1:1 to a `heartbeats` row). `token` is the capability secret embedded

@@ -13,7 +13,9 @@ use tower::ServiceExt;
 const TOKEN: &str = DEFAULT_SERVICE_TOKEN;
 
 async fn body_string(resp: axum::response::Response) -> String {
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
@@ -114,6 +116,48 @@ async fn append_then_read_by_offset() {
     let v = json_of(&body_string(resp).await);
     assert_eq!(v["count"], 1);
     assert_eq!(v["events"][0]["payload"], "b");
+}
+
+#[tokio::test]
+async fn read_filters_by_key_and_payload_fragment() {
+    let app = app(build_dev_state());
+
+    for (key, payload) in [
+        ("created", "alice paid"),
+        ("updated", "bob refunded"),
+        ("created", "alice shipped"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/streams/orders/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"key":"{key}","payload":"{payload}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/streams/orders/events?key=created&contains=shipped")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_of(&body_string(resp).await);
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["events"][0]["key"], "created");
+    assert_eq!(v["events"][0]["payload"], "alice shipped");
 }
 
 #[tokio::test]
@@ -232,4 +276,19 @@ async fn console_renders_streams_and_escapes() {
     // The payload metacharacters are escaped, never injected raw.
     assert!(html.contains("&lt;script&gt;"));
     assert!(!html.contains("<script>x</script>"));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/?stream=orders&contains=script")
+                .header("x-auth-email", "ops@w33d.xyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(html.contains("Event query"));
+    assert!(html.contains("&lt;script&gt;"));
 }

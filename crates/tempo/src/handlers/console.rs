@@ -13,10 +13,12 @@ use serde::Deserialize;
 
 use crate::audit::AuditEvent;
 use crate::auth::{self, Identity};
+use crate::config::RUN_PAGE_SIZE;
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_ago, fmt_ts, html_with_csrf, page, redirect, short};
+use crate::handlers::{esc, fmt_ago, fmt_ts, fmt_until, html_with_csrf, page, redirect, short};
 use crate::model::{
-    Heartbeat, Job, Run, KIND_CRON, KIND_HEARTBEAT, STATUS_DOWN, STATUS_FAIL, STATUS_OK, STATUS_UP,
+    Heartbeat, Job, Retry, RunPage, DEFAULT_MAX_ATTEMPTS, KIND_CRON, KIND_HEARTBEAT, STATUS_DLQ,
+    STATUS_DOWN, STATUS_FAIL, STATUS_OK, STATUS_UP,
 };
 use crate::{now_secs, random_alnum, schedule, AppState};
 
@@ -32,6 +34,10 @@ const DEFAULT_GRACE_SECS: i64 = 300;
 pub struct IndexQuery {
     #[serde(default)]
     pub edit: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub page: Option<i64>,
 }
 
 pub async fn index(
@@ -48,8 +54,23 @@ pub async fn index(
         _ => None,
     };
 
-    let body = build_dashboard(&state, &who, &csrf, edit_job.as_ref(), None).await;
-    html_with_csrf(StatusCode::OK, page("Tempo", Some(&who.email), &body), &csrf)
+    let run_status = normalize_run_status(q.status.as_deref());
+    let run_page = q.page.unwrap_or(1).max(1);
+    let body = build_dashboard(
+        &state,
+        &who,
+        &csrf,
+        edit_job.as_ref(),
+        None,
+        &run_status,
+        run_page,
+    )
+    .await;
+    html_with_csrf(
+        StatusCode::OK,
+        page("Tempo", Some(&who.email), &body),
+        &csrf,
+    )
 }
 
 // ===========================================================================
@@ -106,7 +127,16 @@ pub async fn save_job(
     if form.id.trim().is_empty() {
         create_job(&state, &who, name, &form, enabled, grace_secs).await
     } else {
-        edit_job(&state, &who, form.id.trim(), name, &form, enabled, grace_secs).await
+        edit_job(
+            &state,
+            &who,
+            form.id.trim(),
+            name,
+            &form,
+            enabled,
+            grace_secs,
+        )
+        .await
     }
 }
 
@@ -227,6 +257,17 @@ fn normalize_kind(raw: &str) -> String {
     }
 }
 
+fn normalize_run_status(raw: Option<&str>) -> String {
+    match raw.unwrap_or_default().trim() {
+        STATUS_OK => STATUS_OK.to_string(),
+        STATUS_FAIL => STATUS_FAIL.to_string(),
+        STATUS_DLQ => STATUS_DLQ.to_string(),
+        STATUS_DOWN => STATUS_DOWN.to_string(),
+        STATUS_UP => STATUS_UP.to_string(),
+        _ => String::new(),
+    }
+}
+
 /// Scheme-allowlist for fired targets (no `javascript:`/`file:`/relative).
 fn is_http_url(url: &str) -> bool {
     let u = url.to_ascii_lowercase();
@@ -273,6 +314,69 @@ pub async fn toggle_job(
 }
 
 // ===========================================================================
+// POST /api/runs/{id}/replay — manually replay one DLQ run
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ReplayForm {
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
+pub async fn replay_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<ReplayForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let run = state
+        .store
+        .get_run(&id)
+        .await
+        .ok_or_else(|| AppError::NotFound("no such run".to_string()))?;
+    if run.status != STATUS_DLQ {
+        return Err(AppError::BadRequest(
+            "Only dead-lettered runs can be replayed.".to_string(),
+        ));
+    }
+    let job = state
+        .store
+        .get_job(&run.job_id)
+        .await
+        .ok_or_else(|| AppError::NotFound("no such job".to_string()))?;
+    if job.is_heartbeat() || !job.enabled {
+        return Err(AppError::BadRequest(
+            "Enable the cron job before replaying its DLQ run.".to_string(),
+        ));
+    }
+
+    let now = now_secs();
+    let retry = Retry {
+        id: format!("retry_{}", random_alnum(20)),
+        job_id: job.id.clone(),
+        source_run_id: run.id.clone(),
+        attempt: 1,
+        max_attempts: DEFAULT_MAX_ATTEMPTS,
+        due_at: now,
+        created_at: now,
+    };
+    state.store.enqueue_retry(&retry).await?;
+    state.audit.emit(AuditEvent::notice(
+        "tempo.run.replay",
+        &who.email,
+        &job.name,
+        &format!("run={}", run.id),
+    ));
+    Ok(redirect("/?status=dlq"))
+}
+
+// ===========================================================================
 // Rendering
 // ===========================================================================
 
@@ -282,15 +386,24 @@ async fn build_dashboard(
     csrf: &str,
     edit_job: Option<&Job>,
     _banner: Option<&str>,
+    run_status: &str,
+    run_page_num: i64,
 ) -> String {
     let now = now_secs();
     let jobs = state.store.list_jobs().await;
-    let runs = state.store.recent_runs().await;
+    let runs = state
+        .store
+        .list_runs(
+            run_status,
+            RUN_PAGE_SIZE,
+            (run_page_num - 1).saturating_mul(RUN_PAGE_SIZE),
+        )
+        .await;
     let heartbeats = state.store.list_heartbeats().await;
 
     let stat_grid = render_stats(&jobs, now);
     let job_list = render_jobs(&jobs, &heartbeats, &state.config.public_base_url, csrf, now);
-    let run_table = render_runs(&runs, now);
+    let run_table = render_runs(&runs, now, csrf, run_status, run_page_num);
     let form = render_form(csrf, edit_job);
 
     format!(
@@ -301,7 +414,7 @@ async fn build_dashboard(
 {stat_grid}
 <div class="layout">
   <section class="card">
-    <div class="card__head"><h2>Recent runs</h2></div>
+    <div class="card__head"><h2>Run history</h2>{run_filter}</div>
     <div class="card__body--list">{run_table}</div>
   </section>
   <div>
@@ -317,6 +430,7 @@ async fn build_dashboard(
         email = esc(&who.email),
         tick = state.config.tick_secs,
         stat_grid = stat_grid,
+        run_filter = render_run_filter(run_status),
         run_table = run_table,
         job_list = job_list,
         form = form,
@@ -395,7 +509,10 @@ fn render_job_row(
                 } else {
                     "<span class=\"status-badge status-badge--down\">overdue</span>"
                 };
-                (badge.to_string(), format!("last beat {}", fmt_ago(h.last_beat_at, now)))
+                (
+                    badge.to_string(),
+                    format!("last beat {}", fmt_ago(h.last_beat_at, now)),
+                )
             }
             None => (
                 "<span class=\"status-badge status-badge--wait\">waiting</span>".to_string(),
@@ -414,14 +531,24 @@ fn render_job_row(
             ping_url = esc(&ping_url),
         )
     } else {
-        let sched = schedule::parse(&job.schedule)
-            .map(|s| s.describe())
-            .unwrap_or_else(|| format!("unparsed: {}", job.schedule));
+        let (sched, next_due, next_ts) = match schedule::parse(&job.schedule) {
+            Some(s) => {
+                let due = s.next_due_at(job.last_run_at, now);
+                (s.describe(), fmt_until(due, now), fmt_ts(due))
+            }
+            None => (
+                format!("unparsed: {}", job.schedule),
+                "unknown".to_string(),
+                String::new(),
+            ),
+        };
         format!(
-            r##"<div class="job-item__line">{status} <span class="muted">{sched} · last run {last}</span></div>
+            r##"<div class="job-item__line">{status} <span class="muted">{sched} · next run <span title="{next_ts}">{next_due}</span> · last run {last}</span></div>
   <div class="job-item__url">GET <code>{target}</code></div>"##,
             status = status_badge(&job.last_status),
             sched = esc(&sched),
+            next_due = esc(&next_due),
+            next_ts = esc(&next_ts),
             last = esc(&fmt_ago(job.last_run_at, now)),
             target = esc(&job.target_url),
         )
@@ -458,69 +585,160 @@ fn render_job_row(
 fn status_badge(status: &str) -> String {
     let (class, label) = match status {
         STATUS_OK | STATUS_UP => ("status-badge--ok", status),
-        STATUS_FAIL | STATUS_DOWN => ("status-badge--down", status),
+        STATUS_FAIL | STATUS_DOWN | STATUS_DLQ => ("status-badge--down", status),
         "" => ("status-badge--wait", "pending"),
         other => ("status-badge--wait", other),
     };
     format!("<span class=\"status-badge {class}\">{}</span>", esc(label))
 }
 
-fn render_runs(runs: &[Run], now: i64) -> String {
-    if runs.is_empty() {
+fn render_run_filter(status: &str) -> String {
+    let options = [
+        ("", "all"),
+        (STATUS_OK, STATUS_OK),
+        (STATUS_FAIL, STATUS_FAIL),
+        (STATUS_DLQ, STATUS_DLQ),
+        (STATUS_DOWN, STATUS_DOWN),
+        (STATUS_UP, STATUS_UP),
+    ]
+    .iter()
+    .map(|(value, label)| {
+        let selected = if *value == status { "selected" } else { "" };
+        format!(
+            "<option value=\"{}\" {selected}>{}</option>",
+            esc(value),
+            esc(label)
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("");
+    format!(
+        r##"<form class="inline-form run-filter" method="get" action="/">
+  <select name="status" aria-label="Run status">{options}</select>
+  <button class="btn btn-ghost btn-sm" type="submit">Filter</button>
+</form>"##,
+    )
+}
+
+fn render_runs(page: &RunPage, now: i64, csrf: &str, status: &str, page_num: i64) -> String {
+    if page.runs.is_empty() {
         return "<div class=\"log-empty\">No runs yet. Fired cron jobs and heartbeat transitions appear here.</div>".to_string();
     }
-    let rows = runs
+    let rows = page
+        .runs
         .iter()
         .map(|r| {
+            let action = if r.status == STATUS_DLQ {
+                format!(
+                    r##"<form class="inline-form" method="post" action="/api/runs/{id}/replay">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <button class="btn btn-danger btn-sm" type="submit">Replay</button>
+</form>"##,
+                    id = esc(&r.id),
+                    csrf = esc(csrf),
+                )
+            } else {
+                String::new()
+            };
             format!(
                 r##"<tr>
   <td class="log__when" title="{ts}">{ago}</td>
   <td>{badge}</td>
   <td class="log__detail">{detail}</td>
   <td class="log__hash"><code>{job}</code></td>
+  <td>{action}</td>
 </tr>"##,
                 ts = esc(&fmt_ts(r.started_at)),
                 ago = esc(&fmt_ago(r.started_at, now)),
                 badge = status_badge(&r.status),
                 detail = esc(&r.detail),
                 job = esc(&short(&r.job_id, 16)),
+                action = action,
             )
         })
         .collect::<Vec<_>>()
         .join("");
+    let pager = render_run_pager(status, page_num, page.total);
     format!(
         r##"<table class="log-table">
-  <thead><tr><th>When</th><th>Status</th><th>Detail</th><th>Job</th></tr></thead>
+  <thead><tr><th>When</th><th>Status</th><th>Detail</th><th>Job</th><th>Action</th></tr></thead>
   <tbody>{rows}</tbody>
-</table>"##,
+</table>{pager}"##,
     )
+}
+
+fn render_run_pager(status: &str, page_num: i64, total: i64) -> String {
+    let pages = ((total + RUN_PAGE_SIZE - 1) / RUN_PAGE_SIZE).max(1);
+    if pages <= 1 {
+        return String::new();
+    }
+    let prev = if page_num > 1 {
+        format!(
+            "<a class=\"btn btn-ghost btn-sm\" href=\"{}\">Previous</a>",
+            esc(&run_page_href(status, page_num - 1))
+        )
+    } else {
+        "<span class=\"btn btn-ghost btn-sm btn-disabled\">Previous</span>".to_string()
+    };
+    let next = if page_num < pages {
+        format!(
+            "<a class=\"btn btn-ghost btn-sm\" href=\"{}\">Next</a>",
+            esc(&run_page_href(status, page_num + 1))
+        )
+    } else {
+        "<span class=\"btn btn-ghost btn-sm btn-disabled\">Next</span>".to_string()
+    };
+    format!(
+        r##"<div class="pager">{prev}<span class="muted">Page {page} of {pages} · {total} runs</span>{next}</div>"##,
+        prev = prev,
+        page = page_num,
+        pages = pages,
+        total = total,
+        next = next,
+    )
+}
+
+fn run_page_href(status: &str, page: i64) -> String {
+    if status.is_empty() {
+        format!("/?page={page}")
+    } else {
+        format!("/?status={}&page={page}", status)
+    }
 }
 
 /// The create/edit job form. When `edit` is `Some`, it is pre-filled and titled "Edit job".
 fn render_form(csrf: &str, edit: Option<&Job>) -> String {
-    let (heading, id_value, name_value, kind_value, schedule_value, target_value, grace_value, enabled) =
-        match edit {
-            Some(j) => (
-                "Edit job",
-                j.id.as_str(),
-                j.name.clone(),
-                j.kind.clone(),
-                j.schedule.clone(),
-                j.target_url.clone(),
-                j.grace_secs.to_string(),
-                j.enabled,
-            ),
-            None => (
-                "Add job",
-                "",
-                String::new(),
-                KIND_CRON.to_string(),
-                String::new(),
-                String::new(),
-                DEFAULT_GRACE_SECS.to_string(),
-                true,
-            ),
-        };
+    let (
+        heading,
+        id_value,
+        name_value,
+        kind_value,
+        schedule_value,
+        target_value,
+        grace_value,
+        enabled,
+    ) = match edit {
+        Some(j) => (
+            "Edit job",
+            j.id.as_str(),
+            j.name.clone(),
+            j.kind.clone(),
+            j.schedule.clone(),
+            j.target_url.clone(),
+            j.grace_secs.to_string(),
+            j.enabled,
+        ),
+        None => (
+            "Add job",
+            "",
+            String::new(),
+            KIND_CRON.to_string(),
+            String::new(),
+            String::new(),
+            DEFAULT_GRACE_SECS.to_string(),
+            true,
+        ),
+    };
 
     let kind_disabled = if edit.is_some() {
         // Kind is fixed once a job (and its heartbeat token) exists.
@@ -528,8 +746,16 @@ fn render_form(csrf: &str, edit: Option<&Job>) -> String {
     } else {
         ""
     };
-    let cron_selected = if kind_value == KIND_CRON { "selected" } else { "" };
-    let hb_selected = if kind_value == KIND_HEARTBEAT { "selected" } else { "" };
+    let cron_selected = if kind_value == KIND_CRON {
+        "selected"
+    } else {
+        ""
+    };
+    let hb_selected = if kind_value == KIND_HEARTBEAT {
+        "selected"
+    } else {
+        ""
+    };
     let enabled_checked = if enabled { "checked" } else { "" };
     let cancel = if edit.is_some() {
         r#"<a class="btn btn-ghost" href="/">Cancel</a>"#

@@ -14,7 +14,7 @@
 //! The `Store` trait is async: each method `.await`s sqlx natively (no `block_in_place`), so it runs
 //! on any Tokio scheduler — this test stays on `multi_thread` for parallel queries.
 
-use tempo::model::{Heartbeat, Job, Run, KIND_CRON, KIND_HEARTBEAT, STATUS_OK};
+use tempo::model::{Heartbeat, Job, Retry, Run, KIND_CRON, KIND_HEARTBEAT, STATUS_DLQ, STATUS_OK};
 use tempo::store::{PgStore, Store, StoreError};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -28,7 +28,9 @@ async fn pg_store_full_integration() {
     };
 
     // --- connect / migrate (idempotent: run twice) -------------------------
-    let pg = PgStore::connect(&url).await.expect("connect TEST_DATABASE_URL");
+    let pg = PgStore::connect(&url)
+        .await
+        .expect("connect TEST_DATABASE_URL");
     pg.migrate().await.expect("migrate");
     pg.migrate().await.expect("migrate is idempotent");
 
@@ -82,7 +84,9 @@ async fn pg_store_full_integration() {
 
     // Toggle + touch.
     assert!(pg.set_enabled("job_pg_cron", true).await.expect("toggle"));
-    pg.touch_job("job_pg_cron", 12345, STATUS_OK).await.expect("touch");
+    pg.touch_job("job_pg_cron", 12345, STATUS_OK)
+        .await
+        .expect("touch");
     let after = pg.get_job("job_pg_cron").await.expect("get2");
     assert!(after.enabled);
     assert_eq!(after.last_run_at, 12345);
@@ -114,6 +118,37 @@ async fn pg_store_full_integration() {
     let runs = pg.recent_runs().await;
     assert!(runs.len() >= 3);
     assert_eq!(runs[0].id, "run_pg_2", "newest first");
+    assert_eq!(pg.get_run("run_pg_2").await.unwrap().status, STATUS_OK);
+    pg.insert_run(&Run {
+        id: "run_pg_dlq".to_string(),
+        job_id: "job_pg_cron".to_string(),
+        started_at: 500,
+        status: STATUS_DLQ.to_string(),
+        detail: "dead".to_string(),
+    })
+    .await
+    .expect("insert dlq");
+    let dlq_page = pg.list_runs(STATUS_DLQ, 10, 0).await;
+    assert!(dlq_page.total >= 1);
+    assert!(dlq_page.runs.iter().any(|r| r.id == "run_pg_dlq"));
+
+    // --- retry queue: insert / due / delete -------------------------------
+    let retry = Retry {
+        id: "retry_pg_1".to_string(),
+        job_id: "job_pg_cron".to_string(),
+        source_run_id: "run_pg_dlq".to_string(),
+        attempt: 1,
+        max_attempts: 3,
+        due_at: 600,
+        created_at: 500,
+    };
+    pg.enqueue_retry(&retry).await.expect("enqueue retry");
+    pg.enqueue_retry(&retry)
+        .await
+        .expect("enqueue retry idempotent");
+    let due = pg.due_retries(700, 10).await;
+    assert!(due.iter().any(|r| r.id == "retry_pg_1"));
+    assert!(pg.delete_retry("retry_pg_1").await.expect("delete retry"));
 
     // --- heartbeats: create / get / touch / list ---------------------------
     let hb = Heartbeat {
@@ -123,15 +158,24 @@ async fn pg_store_full_integration() {
     };
     pg.create_heartbeat(&hb).await.expect("create hb");
     // Idempotent.
-    pg.create_heartbeat(&hb).await.expect("create hb idempotent");
+    pg.create_heartbeat(&hb)
+        .await
+        .expect("create hb idempotent");
     assert!(pg.get_heartbeat("tok_pg_abc").await.is_some());
-    assert!(pg.touch_heartbeat("tok_pg_abc", 7777).await.expect("touch hb"));
+    assert!(pg
+        .touch_heartbeat("tok_pg_abc", 7777)
+        .await
+        .expect("touch hb"));
     assert_eq!(
         pg.get_heartbeat("tok_pg_abc").await.unwrap().last_beat_at,
         7777
     );
     assert!(!pg.touch_heartbeat("nope", 1).await.expect("touch unknown"));
-    assert!(pg.list_heartbeats().await.iter().any(|h| h.token == "tok_pg_abc"));
+    assert!(pg
+        .list_heartbeats()
+        .await
+        .iter()
+        .any(|h| h.token == "tok_pg_abc"));
 
     println!(
         "PG STORE INTEGRATION OK: migrate (idempotent) + jobs create/conflict/list/update/toggle/\

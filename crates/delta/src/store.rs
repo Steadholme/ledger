@@ -66,8 +66,13 @@ pub enum StoreError {
 pub trait Store: Send + Sync {
     /// Append one event to `stream`, allocating the next monotonic `seq`. Serialized so two
     /// concurrent appends can never collide on a `seq`. Returns the sealed [`Event`].
-    async fn append(&self, stream: &str, key: &str, payload: &str, now: i64)
-        -> Result<Event, StoreError>;
+    async fn append(
+        &self,
+        stream: &str,
+        key: &str,
+        payload: &str,
+        now: i64,
+    ) -> Result<Event, StoreError>;
 
     /// Durable read by offset: events of `stream` with `seq > after`, ascending, capped at `limit`.
     async fn read_after(&self, stream: &str, after: i64, limit: i64) -> Vec<Event>;
@@ -94,6 +99,16 @@ pub trait Store: Send + Sync {
 
     /// The latest `limit` events of `stream`, newest-first (the console "tail").
     async fn tail(&self, stream: &str, limit: i64) -> Vec<Event>;
+    /// Filterable event query, ascending by `seq`. Empty `stream`, `key`, or `contains` means no
+    /// filter for that dimension.
+    async fn query_events(
+        &self,
+        stream: &str,
+        key: &str,
+        contains: &str,
+        after: i64,
+        limit: i64,
+    ) -> Vec<Event>;
 
     /// All consumer cursors, ordered by `(consumer, stream)`.
     async fn list_cursors(&self) -> Vec<Cursor>;
@@ -216,6 +231,28 @@ impl Store for InMemoryStore {
             .cloned()
             .collect();
         v.sort_by(|a, b| b.seq.cmp(&a.seq));
+        v.truncate(limit.max(0) as usize);
+        v
+    }
+
+    async fn query_events(
+        &self,
+        stream: &str,
+        key: &str,
+        contains: &str,
+        after: i64,
+        limit: i64,
+    ) -> Vec<Event> {
+        let events = self.events.lock().expect("events lock poisoned");
+        let mut v: Vec<Event> = events
+            .iter()
+            .filter(|e| stream.is_empty() || e.stream == stream)
+            .filter(|e| e.seq > after)
+            .filter(|e| key.is_empty() || e.key == key)
+            .filter(|e| contains.is_empty() || e.payload.contains(contains))
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| a.seq.cmp(&b.seq));
         v.truncate(limit.max(0) as usize);
         v
     }
@@ -462,6 +499,35 @@ impl PgStore {
         rows.iter().map(Self::event_from_row).collect()
     }
 
+    async fn query_events_async(
+        &self,
+        stream: &str,
+        key: &str,
+        contains: &str,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>, sqlx::Error> {
+        let pattern = like_contains_pattern(contains);
+        let rows = sqlx::query(
+            "SELECT seq, stream, key, payload, created_at \
+             FROM events \
+             WHERE ($1 = '' OR stream = $1) \
+               AND seq > $2 \
+               AND ($3 = '' OR key = $3) \
+               AND ($4 = '' OR payload LIKE $5 ESCAPE '\\') \
+             ORDER BY seq ASC LIMIT $6",
+        )
+        .bind(stream)
+        .bind(after)
+        .bind(key)
+        .bind(contains)
+        .bind(pattern)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::event_from_row).collect()
+    }
+
     async fn list_cursors_async(&self) -> Result<Vec<Cursor>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT consumer, stream, offset_seq, updated_at \
@@ -550,12 +616,41 @@ impl Store for PgStore {
         })
     }
 
+    async fn query_events(
+        &self,
+        stream: &str,
+        key: &str,
+        contains: &str,
+        after: i64,
+        limit: i64,
+    ) -> Vec<Event> {
+        self.query_events_async(stream, key, contains, after, limit.max(0))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg query_events failed");
+                Vec::new()
+            })
+    }
+
     async fn list_cursors(&self) -> Vec<Cursor> {
         self.list_cursors_async().await.unwrap_or_else(|e| {
             tracing::error!(error = %e, "pg list_cursors failed");
             Vec::new()
         })
     }
+}
+
+fn like_contains_pattern(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('%');
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
 }
 
 #[cfg(test)]
@@ -593,6 +688,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_events_filters_by_stream_key_payload_and_offset() {
+        let s = InMemoryStore::new();
+        s.append("orders", "created", "alice paid", 1)
+            .await
+            .unwrap();
+        s.append("orders", "updated", "bob refunded", 2)
+            .await
+            .unwrap();
+        s.append("billing", "created", "alice invoice", 3)
+            .await
+            .unwrap();
+
+        let got = s.query_events("orders", "created", "alice", 0, 10).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].payload, "alice paid");
+
+        let got = s.query_events("", "created", "alice", 1, 10).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].stream, "billing");
+    }
+
+    #[test]
+    fn like_contains_pattern_escapes_wildcards() {
+        assert_eq!(like_contains_pattern("a%b_c\\d"), "%a\\%b\\_c\\\\d%");
+    }
+
+    #[tokio::test]
     async fn cursor_commit_is_idempotent_upsert() {
         let s = InMemoryStore::new();
         assert!(s.get_cursor("c1", "orders").await.is_none());
@@ -624,6 +746,9 @@ mod tests {
         }
         seqs.sort();
         let expected: Vec<i64> = (1..=64).collect();
-        assert_eq!(seqs, expected, "seqs must be a gap-free 1..=64 with no duplicates");
+        assert_eq!(
+            seqs, expected,
+            "seqs must be a gap-free 1..=64 with no duplicates"
+        );
     }
 }

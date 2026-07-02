@@ -17,6 +17,10 @@ pub const DEFAULT_TICK_SECS: u64 = 30;
 
 /// Hard cap on how many run-log rows the console renders.
 pub const RUN_LIMIT: usize = 50;
+/// Run-log rows per console page when filtering/paginating history.
+pub const RUN_PAGE_SIZE: i64 = 25;
+/// Maximum due retries processed in one scheduler tick.
+pub const RETRY_BATCH_LIMIT: i64 = 25;
 
 /// Optional Klaxon notify target. Present only when `KLAXON_URL` + `KLAXON_INGEST_TOKEN` +
 /// `KLAXON_NOTIFY_EMAIL` are ALL configured — otherwise notify silently degrades to off.

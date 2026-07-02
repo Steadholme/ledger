@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use tempo::model::{KIND_HEARTBEAT, STATUS_DOWN, STATUS_UP};
+use tempo::model::{
+    Job, Run, KIND_CRON, KIND_HEARTBEAT, STATUS_DLQ, STATUS_DOWN, STATUS_FAIL, STATUS_UP,
+};
 use tempo::store::{InMemoryStore, Store};
 use tempo::{app, build_dev_state, now_secs, scheduler, AppState};
 use tower::ServiceExt;
@@ -33,7 +35,10 @@ async fn console_guards_and_job_lifecycle() {
         .get(header::SET_COOKIE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    assert!(set_cookie.contains("__Host-csrf="), "GET / mints CSRF cookie");
+    assert!(
+        set_cookie.contains("__Host-csrf="),
+        "GET / mints CSRF cookie"
+    );
     let (_, html) = read(resp).await;
     assert!(html.contains("No jobs yet"), "empty job list placeholder");
 
@@ -59,7 +64,11 @@ async fn console_guards_and_job_lifecycle() {
         ("csrf_token", CSRF),
     ]);
     let (status, _) = call(&state, post_csrf("/api/jobs", &bad)).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "unparseable schedule -> 400");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unparseable schedule -> 400"
+    );
 
     // --- non-http target rejected ------------------------------------------
     let bad_url = form(&[
@@ -85,9 +94,16 @@ async fn console_guards_and_job_lifecycle() {
     // --- toggle requires CSRF ----------------------------------------------
     let job_id = first_job_id(&state).await;
     let toggle = form(&[("csrf_token", CSRF)]);
-    let (status, _) = call(&state, post_csrf(&format!("/api/jobs/{job_id}/toggle"), &toggle)).await;
+    let (status, _) = call(
+        &state,
+        post_csrf(&format!("/api/jobs/{job_id}/toggle"), &toggle),
+    )
+    .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(!state.store.get_job(&job_id).await.unwrap().enabled, "toggled off");
+    assert!(
+        !state.store.get_job(&job_id).await.unwrap().enabled,
+        "toggled off"
+    );
 }
 
 #[tokio::test]
@@ -127,7 +143,15 @@ async fn heartbeat_ping_and_deadman_sweep() {
     let (status, b) = call(&state, get(&format!("/ping/{token}"))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(b, "ok");
-    assert!(state.store.get_heartbeat(&token).await.unwrap().last_beat_at > 0);
+    assert!(
+        state
+            .store
+            .get_heartbeat(&token)
+            .await
+            .unwrap()
+            .last_beat_at
+            > 0
+    );
 
     // --- force the beat into the past so the dead-man window has elapsed ----
     let stale = now_secs() - 600;
@@ -141,7 +165,10 @@ async fn heartbeat_ping_and_deadman_sweep() {
         "silent heartbeat flagged down"
     );
     let runs = state.store.recent_runs().await;
-    assert!(runs.iter().any(|r| r.status == STATUS_DOWN), "down run recorded");
+    assert!(
+        runs.iter().any(|r| r.status == STATUS_DOWN),
+        "down run recorded"
+    );
 
     // A fresh beat + another sweep records recovery.
     store.touch_heartbeat(&token, now_secs()).await.unwrap();
@@ -154,6 +181,90 @@ async fn heartbeat_ping_and_deadman_sweep() {
 
     // Idempotent: a heartbeat job is not a cron job and never carries the heartbeat kind wrongly.
     assert!(state.store.get_job(&job_id).await.unwrap().kind == KIND_HEARTBEAT);
+}
+
+#[tokio::test]
+async fn dlq_run_can_be_filtered_and_replayed() {
+    let state = build_dev_state();
+    let now = now_secs();
+    state
+        .store
+        .create_job(&Job {
+            id: "job_dead".to_string(),
+            name: "dead cron".to_string(),
+            kind: KIND_CRON.to_string(),
+            schedule: "@every 30s".to_string(),
+            target_url: "https://example.com/ping".to_string(),
+            grace_secs: 300,
+            enabled: true,
+            last_run_at: now,
+            last_status: STATUS_DLQ.to_string(),
+            created_at: now,
+        })
+        .await
+        .unwrap();
+    state
+        .store
+        .insert_run(&Run {
+            id: "run_dead".to_string(),
+            job_id: "job_dead".to_string(),
+            started_at: now,
+            status: STATUS_DLQ.to_string(),
+            detail: "attempt 3/3 exhausted; moved to DLQ".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let (_, html) = call(&state, get("/?status=dlq")).await;
+    assert!(html.contains("run history") || html.contains("Run history"));
+    assert!(html.contains("Replay"));
+    assert!(html.contains("attempt 3/3"));
+
+    let body = form(&[("csrf_token", CSRF)]);
+    let (status, _) = call(&state, post_csrf("/api/runs/run_dead/replay", &body)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let retries = state.store.due_retries(now_secs() + 60, 10).await;
+    assert_eq!(retries.len(), 1);
+    assert_eq!(retries[0].source_run_id, "run_dead");
+    assert_eq!(retries[0].job_id, "job_dead");
+}
+
+#[tokio::test]
+async fn failing_cron_fire_queues_retry() {
+    let state = build_dev_state();
+    state
+        .store
+        .create_job(&Job {
+            id: "job_retry".to_string(),
+            name: "retry cron".to_string(),
+            kind: KIND_CRON.to_string(),
+            schedule: "@every 30s".to_string(),
+            target_url: "http://127.0.0.1:9/unreachable".to_string(),
+            grace_secs: 300,
+            enabled: true,
+            last_run_at: 0,
+            last_status: String::new(),
+            created_at: now_secs(),
+        })
+        .await
+        .unwrap();
+
+    scheduler::tick(&state).await;
+
+    assert_eq!(
+        state.store.get_job("job_retry").await.unwrap().last_status,
+        STATUS_FAIL
+    );
+    let runs = state.store.recent_runs().await;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, STATUS_FAIL);
+    assert!(runs[0].detail.contains("retry queued"));
+
+    let retries = state.store.due_retries(now_secs() + 60, 10).await;
+    assert_eq!(retries.len(), 1);
+    assert_eq!(retries[0].job_id, "job_retry");
+    assert_eq!(retries[0].attempt, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +282,9 @@ async fn call(state: &AppState, req: Request<Body>) -> (StatusCode, String) {
 
 async fn read(resp: axum::response::Response) -> (StatusCode, String) {
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, String::from_utf8_lossy(&bytes).to_string())
 }
 
@@ -217,7 +330,9 @@ fn enc(s: &str) -> String {
     let mut o = String::new();
     for b in s.bytes() {
         match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => o.push(b as char),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                o.push(b as char)
+            }
             b' ' => o.push('+'),
             _ => o.push_str(&format!("%{b:02X}")),
         }

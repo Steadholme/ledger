@@ -40,6 +40,31 @@ impl Schedule {
         }
     }
 
+    /// The next due timestamp for console display. If the job is already due, returns `now`.
+    pub fn next_due_at(&self, last_run_at: i64, now: i64) -> i64 {
+        match *self {
+            Schedule::Every(secs) => {
+                if self.is_due(last_run_at, now) {
+                    now
+                } else {
+                    last_run_at + secs
+                }
+            }
+            Schedule::DailyAt(h, m) => {
+                if self.is_due(last_run_at, now) {
+                    return now;
+                }
+                let midnight = now.div_euclid(SECS_PER_DAY) * SECS_PER_DAY;
+                let today = midnight + (h as i64) * 3600 + (m as i64) * 60;
+                if today > now {
+                    today
+                } else {
+                    today + SECS_PER_DAY
+                }
+            }
+        }
+    }
+
     /// A short human description for the console job list.
     pub fn describe(&self) -> String {
         match *self {
@@ -156,5 +181,24 @@ mod tests {
         assert!(s.is_due(nine_am - SECS_PER_DAY, nine_am + 60));
         // Already ran at 09:00 today -> not due again until tomorrow.
         assert!(!s.is_due(nine_am, nine_am + 3600));
+    }
+
+    #[test]
+    fn next_due_reports_now_when_due_otherwise_future() {
+        let s = Schedule::Every(60);
+        assert_eq!(s.next_due_at(0, 1_000), 1_000);
+        assert_eq!(s.next_due_at(970, 1_000), 1_030);
+
+        let day = 20_454_i64 * SECS_PER_DAY;
+        let daily = Schedule::DailyAt(9, 0);
+        let nine_am = day + 9 * 3600;
+        assert_eq!(
+            daily.next_due_at(nine_am, nine_am + 60),
+            nine_am + SECS_PER_DAY
+        );
+        assert_eq!(
+            daily.next_due_at(nine_am - SECS_PER_DAY, nine_am + 60),
+            nine_am + 60
+        );
     }
 }

@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::config::RUN_LIMIT;
-use crate::model::{Heartbeat, Job, Run};
+use crate::model::{Heartbeat, Job, Retry, Run, RunPage};
 
 /// Storage failure surfaced to the handler layer.
 #[derive(Debug, Error)]
@@ -47,14 +47,30 @@ pub trait Store: Send + Sync {
     /// Flip a job's `enabled` flag by id. Returns whether a row changed.
     async fn set_enabled(&self, id: &str, enabled: bool) -> Result<bool, StoreError>;
     /// Record a fire / dead-man transition outcome: set `last_run_at` + `last_status` by id.
-    async fn touch_job(&self, id: &str, last_run_at: i64, last_status: &str)
-        -> Result<(), StoreError>;
+    async fn touch_job(
+        &self,
+        id: &str,
+        last_run_at: i64,
+        last_status: &str,
+    ) -> Result<(), StoreError>;
 
     // --- runs ----------------------------------------------------------------
     /// Append one run row.
     async fn insert_run(&self, run: &Run) -> Result<(), StoreError>;
+    /// One run by id (used by manual replay).
+    async fn get_run(&self, id: &str) -> Option<Run>;
     /// The most recent runs across all jobs, newest-first, capped at [`RUN_LIMIT`].
     async fn recent_runs(&self) -> Vec<Run>;
+    /// A filtered/paginated run history page, newest-first.
+    async fn list_runs(&self, status: &str, limit: i64, offset: i64) -> RunPage;
+
+    // --- retries / DLQ -------------------------------------------------------
+    /// Queue a failed cron run for a later retry. Duplicate retry ids are ignored.
+    async fn enqueue_retry(&self, retry: &Retry) -> Result<(), StoreError>;
+    /// Due retry rows, oldest-first, capped by `limit`.
+    async fn due_retries(&self, now: i64, limit: i64) -> Vec<Retry>;
+    /// Delete one retry row by id. Returns whether a row changed.
+    async fn delete_retry(&self, id: &str) -> Result<bool, StoreError>;
 
     // --- heartbeats ----------------------------------------------------------
     /// Create the heartbeat row for a dead-man job (first writer wins).
@@ -77,6 +93,7 @@ pub trait Store: Send + Sync {
 pub struct InMemoryStore {
     jobs: Mutex<Vec<Job>>,
     runs: Mutex<Vec<Run>>,
+    retries: Mutex<Vec<Retry>>,
     heartbeats: Mutex<Vec<Heartbeat>>,
 }
 
@@ -158,19 +175,76 @@ impl Store for InMemoryStore {
     }
 
     async fn insert_run(&self, run: &Run) -> Result<(), StoreError> {
-        self.runs.lock().expect("runs lock poisoned").push(run.clone());
+        self.runs
+            .lock()
+            .expect("runs lock poisoned")
+            .push(run.clone());
         Ok(())
     }
 
+    async fn get_run(&self, id: &str) -> Option<Run> {
+        self.runs
+            .lock()
+            .expect("runs lock poisoned")
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+    }
+
     async fn recent_runs(&self) -> Vec<Run> {
-        let mut v: Vec<Run> = self.runs.lock().expect("runs lock poisoned").clone();
+        let mut v = self.list_runs("", RUN_LIMIT as i64, 0).await.runs;
+        v.truncate(RUN_LIMIT);
+        v
+    }
+
+    async fn list_runs(&self, status: &str, limit: i64, offset: i64) -> RunPage {
+        let mut v: Vec<Run> = self
+            .runs
+            .lock()
+            .expect("runs lock poisoned")
+            .iter()
+            .filter(|r| status.is_empty() || r.status == status)
+            .cloned()
+            .collect();
         v.sort_by(|a, b| {
             b.started_at
                 .cmp(&a.started_at)
                 .then_with(|| b.id.cmp(&a.id))
         });
-        v.truncate(RUN_LIMIT);
+        let total = v.len() as i64;
+        let start = offset.max(0) as usize;
+        let take = limit.max(0) as usize;
+        let runs = v.into_iter().skip(start).take(take).collect();
+        RunPage { runs, total }
+    }
+
+    async fn enqueue_retry(&self, retry: &Retry) -> Result<(), StoreError> {
+        let mut retries = self.retries.lock().expect("retries lock poisoned");
+        if !retries.iter().any(|r| r.id == retry.id) {
+            retries.push(retry.clone());
+        }
+        Ok(())
+    }
+
+    async fn due_retries(&self, now: i64, limit: i64) -> Vec<Retry> {
+        let mut v: Vec<Retry> = self
+            .retries
+            .lock()
+            .expect("retries lock poisoned")
+            .iter()
+            .filter(|r| r.due_at <= now)
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| a.due_at.cmp(&b.due_at).then_with(|| a.id.cmp(&b.id)));
+        v.truncate(limit.max(0) as usize);
         v
+    }
+
+    async fn delete_retry(&self, id: &str) -> Result<bool, StoreError> {
+        let mut retries = self.retries.lock().expect("retries lock poisoned");
+        let before = retries.len();
+        retries.retain(|r| r.id != id);
+        Ok(retries.len() != before)
     }
 
     async fn create_heartbeat(&self, hb: &Heartbeat) -> Result<(), StoreError> {
@@ -202,7 +276,10 @@ impl Store for InMemoryStore {
     }
 
     async fn list_heartbeats(&self) -> Vec<Heartbeat> {
-        self.heartbeats.lock().expect("heartbeats lock poisoned").clone()
+        self.heartbeats
+            .lock()
+            .expect("heartbeats lock poisoned")
+            .clone()
     }
 }
 
@@ -272,6 +349,23 @@ impl PgStore {
             .await?;
 
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS retry_queue (\
+                 id TEXT PRIMARY KEY, \
+                 job_id TEXT NOT NULL, \
+                 source_run_id TEXT NOT NULL DEFAULT '', \
+                 attempt BIGINT NOT NULL DEFAULT 1, \
+                 max_attempts BIGINT NOT NULL DEFAULT 1, \
+                 due_at BIGINT NOT NULL DEFAULT 0, \
+                 created_at BIGINT NOT NULL DEFAULT 0\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_retry_queue_due ON retry_queue (due_at, id)")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS heartbeats (\
                  token TEXT PRIMARY KEY, \
                  job_id TEXT NOT NULL, \
@@ -314,6 +408,18 @@ impl PgStore {
             token: row.try_get("token")?,
             job_id: row.try_get("job_id")?,
             last_beat_at: row.try_get("last_beat_at")?,
+        })
+    }
+
+    fn retry_from_row(row: &PgRow) -> Result<Retry, sqlx::Error> {
+        Ok(Retry {
+            id: row.try_get("id")?,
+            job_id: row.try_get("job_id")?,
+            source_run_id: row.try_get("source_run_id")?,
+            attempt: row.try_get("attempt")?,
+            max_attempts: row.try_get("max_attempts")?,
+            due_at: row.try_get("due_at")?,
+            created_at: row.try_get("created_at")?,
         })
     }
 }
@@ -454,15 +560,49 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn get_run(&self, id: &str) -> Option<Run> {
+        let row = sqlx::query(
+            "SELECT id, job_id, started_at, status, detail \
+             FROM runs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await;
+        match row {
+            Ok(Some(r)) => Self::run_from_row(&r).ok(),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!(error = %e, "pg get_run failed");
+                None
+            }
+        }
+    }
+
     async fn recent_runs(&self) -> Vec<Run> {
+        let page = self.list_runs("", RUN_LIMIT as i64, 0).await;
+        page.runs
+    }
+
+    async fn list_runs(&self, status: &str, limit: i64, offset: i64) -> RunPage {
         let rows = sqlx::query(
             "SELECT id, job_id, started_at, status, detail \
-             FROM runs ORDER BY started_at DESC, id DESC LIMIT $1",
+             FROM runs \
+             WHERE ($1 = '' OR status = $1) \
+             ORDER BY started_at DESC, id DESC LIMIT $2 OFFSET $3",
         )
-        .bind(RUN_LIMIT as i64)
+        .bind(status)
+        .bind(limit.max(0))
+        .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await;
-        match rows {
+
+        let count = sqlx::query("SELECT count(*) AS cnt FROM runs WHERE ($1 = '' OR status = $1)")
+            .bind(status)
+            .fetch_one(&self.pool)
+            .await
+            .and_then(|r| r.try_get::<i64, _>("cnt"));
+
+        let runs = match rows {
             Ok(rows) => rows
                 .iter()
                 .filter_map(|r| Self::run_from_row(r).ok())
@@ -471,7 +611,63 @@ impl Store for PgStore {
                 tracing::error!(error = %e, "pg recent_runs failed");
                 Vec::new()
             }
+        };
+        RunPage {
+            runs,
+            total: count.unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg count runs failed");
+                0
+            }),
         }
+    }
+
+    async fn enqueue_retry(&self, retry: &Retry) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO retry_queue \
+                 (id, job_id, source_run_id, attempt, max_attempts, due_at, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&retry.id)
+        .bind(&retry.job_id)
+        .bind(&retry.source_run_id)
+        .bind(retry.attempt)
+        .bind(retry.max_attempts)
+        .bind(retry.due_at)
+        .bind(retry.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn due_retries(&self, now: i64, limit: i64) -> Vec<Retry> {
+        let rows = sqlx::query(
+            "SELECT id, job_id, source_run_id, attempt, max_attempts, due_at, created_at \
+             FROM retry_queue WHERE due_at <= $1 ORDER BY due_at ASC, id ASC LIMIT $2",
+        )
+        .bind(now)
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await;
+        match rows {
+            Ok(rows) => rows
+                .iter()
+                .filter_map(|r| Self::retry_from_row(r).ok())
+                .collect(),
+            Err(e) => {
+                tracing::error!(error = %e, "pg due_retries failed");
+                Vec::new()
+            }
+        }
+    }
+
+    async fn delete_retry(&self, id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("DELETE FROM retry_queue WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn create_heartbeat(&self, hb: &Heartbeat) -> Result<(), StoreError> {
@@ -489,10 +685,11 @@ impl Store for PgStore {
     }
 
     async fn get_heartbeat(&self, token: &str) -> Option<Heartbeat> {
-        let row = sqlx::query("SELECT token, job_id, last_beat_at FROM heartbeats WHERE token = $1")
-            .bind(token)
-            .fetch_optional(&self.pool)
-            .await;
+        let row =
+            sqlx::query("SELECT token, job_id, last_beat_at FROM heartbeats WHERE token = $1")
+                .bind(token)
+                .fetch_optional(&self.pool)
+                .await;
         match row {
             Ok(Some(r)) => Self::heartbeat_from_row(&r).ok(),
             Ok(None) => None,
@@ -597,6 +794,60 @@ mod tests {
         let runs = store.recent_runs().await;
         assert_eq!(runs.len(), 3);
         assert_eq!(runs[0].id, "run_2");
+    }
+
+    #[tokio::test]
+    async fn run_history_filters_pages_and_retry_queue_orders_due_work() {
+        let store = InMemoryStore::new();
+        for i in 0..5 {
+            store
+                .insert_run(&Run {
+                    id: format!("run_{i}"),
+                    job_id: "j1".to_string(),
+                    started_at: i as i64,
+                    status: if i % 2 == 0 { "ok" } else { "dlq" }.to_string(),
+                    detail: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.get_run("run_3").await.unwrap().status, "dlq");
+
+        let page = store.list_runs("dlq", 1, 1).await;
+        assert_eq!(page.total, 2);
+        assert_eq!(page.runs.len(), 1);
+        assert_eq!(page.runs[0].id, "run_1");
+
+        store
+            .enqueue_retry(&Retry {
+                id: "retry_late".to_string(),
+                job_id: "j1".to_string(),
+                source_run_id: "run_3".to_string(),
+                attempt: 2,
+                max_attempts: 3,
+                due_at: 30,
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        store
+            .enqueue_retry(&Retry {
+                id: "retry_now".to_string(),
+                job_id: "j1".to_string(),
+                source_run_id: "run_1".to_string(),
+                attempt: 2,
+                max_attempts: 3,
+                due_at: 10,
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+
+        let due = store.due_retries(20, 10).await;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, "retry_now");
+        assert!(store.delete_retry("retry_now").await.unwrap());
+        assert!(store.due_retries(20, 10).await.is_empty());
     }
 
     #[tokio::test]

@@ -49,6 +49,10 @@ pub struct ReadQuery {
     pub after: Option<i64>,
     #[serde(default)]
     pub limit: Option<i64>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub contains: Option<String>,
 }
 
 // ===========================================================================
@@ -66,7 +70,11 @@ pub async fn append(
     }
     let stream = stream.trim();
     if stream.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_request", "stream is required.");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "stream is required.",
+        );
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -129,7 +137,11 @@ pub async fn read(
     }
     let stream = stream.trim();
     if stream.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_request", "stream is required.");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "stream is required.",
+        );
     }
     let after = q.after.unwrap_or(0).max(0);
     let limit = match q.limit {
@@ -144,7 +156,16 @@ pub async fn read(
         None => state.config.read_limit,
     };
 
-    let events = state.store.read_after(stream, after, limit).await;
+    let key = q.key.unwrap_or_default();
+    let contains = q.contains.unwrap_or_default();
+    let events = if key.trim().is_empty() && contains.trim().is_empty() {
+        state.store.read_after(stream, after, limit).await
+    } else {
+        state
+            .store
+            .query_events(stream, key.trim(), contains.trim(), after, limit)
+            .await
+    };
     let head = state.store.head_seq(stream).await;
     let next_after = events.last().map(|e| e.seq).unwrap_or(after);
 
@@ -152,6 +173,8 @@ pub async fn read(
         "stream": stream,
         "after": after,
         "limit": limit,
+        "key": key.trim(),
+        "contains": contains.trim(),
         "count": events.len(),
         "head": head,
         "next_after": next_after,
@@ -219,8 +242,14 @@ pub async fn commit_cursor(
     };
     let head = state.store.head_seq(stream).await;
     tracing::debug!(consumer, stream, offset, "cursor committed");
-    Json(cursor_json(&cursor.consumer, &cursor.stream, cursor.offset_seq, cursor.updated_at, head))
-        .into_response()
+    Json(cursor_json(
+        &cursor.consumer,
+        &cursor.stream,
+        cursor.offset_seq,
+        cursor.updated_at,
+        head,
+    ))
+    .into_response()
 }
 
 // ===========================================================================
@@ -245,9 +274,14 @@ pub async fn read_cursor(
     }
     let head = state.store.head_seq(stream).await;
     match state.store.get_cursor(consumer, stream).await {
-        Some(c) => {
-            Json(cursor_json(&c.consumer, &c.stream, c.offset_seq, c.updated_at, head)).into_response()
-        }
+        Some(c) => Json(cursor_json(
+            &c.consumer,
+            &c.stream,
+            c.offset_seq,
+            c.updated_at,
+            head,
+        ))
+        .into_response(),
         // An uncommitted cursor reads as offset 0 (a fresh consumer starts at the beginning).
         None => Json(cursor_json(consumer, stream, 0, 0, head)).into_response(),
     }
@@ -281,7 +315,13 @@ fn event_json(e: &Event) -> serde_json::Value {
 }
 
 /// JSON shape for a cursor, with the stream `head` and the derived `lag` (head - offset, clamped).
-fn cursor_json(consumer: &str, stream: &str, offset: i64, updated_at: i64, head: i64) -> serde_json::Value {
+fn cursor_json(
+    consumer: &str,
+    stream: &str,
+    offset: i64,
+    updated_at: i64,
+    head: i64,
+) -> serde_json::Value {
     json!({
         "consumer": consumer,
         "stream": stream,

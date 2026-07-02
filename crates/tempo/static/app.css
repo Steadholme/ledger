@@ -265,6 +265,15 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 .log__hash code { font-size: 11.5px; }
 .log-empty { padding: 24px; color: var(--ink-3); font-size: 13px; text-align: center; }
 
+/* ---- Run history filters / pagination ---------------------------------- */
+.run-filter { align-items: center; gap: 8px; }
+.run-filter select { width: auto; min-width: 116px; padding: 7px 10px; font-size: 13px; }
+.pager {
+  display: flex; align-items: center; justify-content: flex-end; gap: 10px;
+  padding: 12px 16px; border-top: 1px solid var(--border); background: var(--surface);
+}
+.btn-disabled { opacity: .5; cursor: default; pointer-events: none; }
+
 /* ---- Error / message page --------------------------------------------- */
 .card--message { max-width: 520px; margin: 40px auto 0; text-align: center; }
 .card--message .card__body { padding: 40px 32px; }

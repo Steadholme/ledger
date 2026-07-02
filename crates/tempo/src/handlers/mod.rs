@@ -64,6 +64,23 @@ pub fn fmt_ago(secs: i64, now: i64) -> String {
     }
 }
 
+/// A compact future due label (`now`, `in 12s`, `in 4m`, `in 2h`, `in 3d`).
+pub fn fmt_until(secs: i64, now: i64) -> String {
+    if secs <= now {
+        return "now".to_string();
+    }
+    let d = secs.saturating_sub(now);
+    if d < 60 {
+        format!("in {d}s")
+    } else if d < 3600 {
+        format!("in {}m", d / 60)
+    } else if d < 86_400 {
+        format!("in {}h", d / 3600)
+    } else {
+        format!("in {}d", d / 86_400)
+    }
+}
+
 /// First `n` characters of a hash/id, for compact display.
 pub fn short(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
@@ -92,7 +109,11 @@ pub fn html_with_csrf(status: StatusCode, body: String, csrf: &str) -> Response 
 
 /// A `303 See Other` redirect (post/redirect/get).
 pub fn redirect(location: &str) -> Response {
-    (StatusCode::SEE_OTHER, [(header::LOCATION, location.to_string())]).into_response()
+    (
+        StatusCode::SEE_OTHER,
+        [(header::LOCATION, location.to_string())],
+    )
+        .into_response()
 }
 
 /// The right side of the app-bar: the page title, an "All apps" link back to the apex portal, a
@@ -177,5 +198,12 @@ mod tests {
         assert_eq!(fmt_ago(0, 1000), "never");
         assert_eq!(fmt_ago(990, 1000), "10s ago");
         assert_eq!(fmt_ago(1000 - 120, 1000), "2m ago");
+    }
+
+    #[test]
+    fn until_buckets() {
+        assert_eq!(fmt_until(1000, 1000), "now");
+        assert_eq!(fmt_until(1010, 1000), "in 10s");
+        assert_eq!(fmt_until(1120, 1000), "in 2m");
     }
 }

@@ -29,15 +29,23 @@ async fn pg_store_full_integration() {
     };
 
     // --- connect / migrate (idempotent: run twice) -------------------------
-    let pg = PgStore::connect(&url).await.expect("connect TEST_DATABASE_URL");
+    let pg = PgStore::connect(&url)
+        .await
+        .expect("connect TEST_DATABASE_URL");
     pg.migrate().await.expect("migrate");
     pg.migrate().await.expect("migrate is idempotent");
     let pg = Arc::new(pg);
 
     // --- append allocates monotonic global seq -----------------------------
-    let a = pg.append("orders", "k1", "p1", 100).await.expect("append a");
+    let a = pg
+        .append("orders", "k1", "p1", 100)
+        .await
+        .expect("append a");
     let b = pg.append("billing", "", "p2", 101).await.expect("append b");
-    let c = pg.append("orders", "k3", "p3", 102).await.expect("append c");
+    let c = pg
+        .append("orders", "k3", "p3", 102)
+        .await
+        .expect("append c");
     assert_eq!((a.seq, b.seq, c.seq), (1, 2, 3));
     assert_eq!(pg.head_seq("orders").await, 3);
     assert_eq!(pg.head_seq("billing").await, 2);
@@ -49,17 +57,26 @@ async fn pg_store_full_integration() {
     assert_eq!(got[1].seq, 3);
     assert_eq!(pg.read_after("orders", 1, 100).await[0].payload, "p3");
     assert_eq!(pg.read_after("orders", 0, 1).await.len(), 1);
+    let queried = pg.query_events("orders", "k3", "p3", 0, 10).await;
+    assert_eq!(queried.len(), 1);
+    assert_eq!(queried[0].seq, 3);
 
     // --- cursor upsert is idempotent + lag derived -------------------------
-    pg.commit_cursor("worker-1", "orders", 1, 200).await.expect("commit 1");
-    pg.commit_cursor("worker-1", "orders", 3, 210).await.expect("commit 2");
+    pg.commit_cursor("worker-1", "orders", 1, 200)
+        .await
+        .expect("commit 1");
+    pg.commit_cursor("worker-1", "orders", 3, 210)
+        .await
+        .expect("commit 2");
     let cur = pg.get_cursor("worker-1", "orders").await.expect("cursor");
     assert_eq!(cur.offset_seq, 3);
     assert_eq!(cur.updated_at, 210);
 
     // --- console aggregates ------------------------------------------------
     let streams = pg.list_streams(100).await;
-    assert!(streams.iter().any(|s| s.stream == "orders" && s.count == 2 && s.head_seq == 3));
+    assert!(streams
+        .iter()
+        .any(|s| s.stream == "orders" && s.count == 2 && s.head_seq == 3));
     let tail = pg.tail("orders", 10).await;
     assert_eq!(tail.first().map(|e| e.seq), Some(3)); // newest-first
     assert_eq!(pg.list_cursors().await.len(), 1);

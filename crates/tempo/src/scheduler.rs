@@ -20,7 +20,11 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::audit::AuditEvent;
-use crate::model::{Heartbeat, Job, Run, STATUS_DOWN, STATUS_FAIL, STATUS_OK, STATUS_UP};
+use crate::config::RETRY_BATCH_LIMIT;
+use crate::model::{
+    Heartbeat, Job, Retry, Run, DEFAULT_MAX_ATTEMPTS, DEFAULT_RETRY_DELAY_SECS, STATUS_DLQ,
+    STATUS_DOWN, STATUS_FAIL, STATUS_OK, STATUS_UP,
+};
 use crate::{now_secs, random_alnum, schedule, AppState};
 
 /// Run the scheduler forever. Spawned detached from `main`; never returns.
@@ -38,6 +42,8 @@ pub async fn run(state: AppState) {
 /// One scheduler sweep. Public so integration tests can drive it deterministically.
 pub async fn tick(state: &AppState) {
     let now = now_secs();
+    process_due_retries(state, now).await;
+
     let jobs = state.store.list_jobs().await;
     let heartbeats = state.store.list_heartbeats().await;
 
@@ -55,9 +61,55 @@ pub async fn tick(state: &AppState) {
     }
 }
 
+/// Process durable retry rows that are due. Retry rows are deleted before firing so a scheduler
+/// crash never double-fires a completed retry; a failed attempt enqueues the next row if needed.
+async fn process_due_retries(state: &AppState, now: i64) {
+    let retries = state.store.due_retries(now, RETRY_BATCH_LIMIT).await;
+    for retry in retries {
+        let Some(job) = state.store.get_job(&retry.job_id).await else {
+            if let Err(e) = state.store.delete_retry(&retry.id).await {
+                tracing::warn!(retry = %retry.id, error = %e, "delete retry for missing job failed");
+            }
+            continue;
+        };
+        if job.is_heartbeat() || !job.enabled {
+            if let Err(e) = state.store.delete_retry(&retry.id).await {
+                tracing::warn!(retry = %retry.id, error = %e, "delete skipped retry failed");
+            }
+            continue;
+        }
+        match state.store.delete_retry(&retry.id).await {
+            Ok(true) => {
+                fire_cron_attempt(
+                    state,
+                    &job,
+                    now,
+                    retry.attempt.max(1),
+                    retry.max_attempts.max(1),
+                    &retry.source_run_id,
+                )
+                .await;
+            }
+            Ok(false) => tracing::debug!(retry = %retry.id, "retry row already gone"),
+            Err(e) => tracing::warn!(retry = %retry.id, error = %e, "delete retry failed"),
+        }
+    }
+}
+
 /// Fire one cron job: GET its target, record the run, update last_run/last_status, and on failure
-/// emit audit + optional Klaxon.
+/// either enqueue a retry or move the run into the DLQ.
 async fn fire_cron(state: &AppState, job: &Job, now: i64) {
+    fire_cron_attempt(state, job, now, 1, DEFAULT_MAX_ATTEMPTS, "").await;
+}
+
+async fn fire_cron_attempt(
+    state: &AppState,
+    job: &Job,
+    now: i64,
+    attempt: i64,
+    max_attempts: i64,
+    source_run_id: &str,
+) {
     let (status, detail) = match state.http.get(&job.target_url).send().await {
         Ok(resp) => {
             let code = resp.status();
@@ -68,25 +120,84 @@ async fn fire_cron(state: &AppState, job: &Job, now: i64) {
                 (STATUS_FAIL, detail)
             }
         }
-        Err(e) => (STATUS_FAIL, format!("GET {} -> error: {}", job.target_url, e)),
+        Err(e) => (
+            STATUS_FAIL,
+            format!("GET {} -> error: {}", job.target_url, e),
+        ),
     };
 
-    record_run(state, &job.id, now, status, &detail).await;
-    if let Err(e) = state.store.touch_job(&job.id, now, status).await {
+    if status == STATUS_OK {
+        let detail = attempt_detail(&detail, attempt, max_attempts);
+        record_run(state, &job.id, now, STATUS_OK, &detail).await;
+        if let Err(e) = state.store.touch_job(&job.id, now, STATUS_OK).await {
+            tracing::warn!(job = %job.id, error = %e, "touch_job failed after fire");
+        }
+        tracing::info!(job = %job.id, attempt, "cron job fired ok");
+        return;
+    }
+
+    let exhausted = attempt >= max_attempts.max(1);
+    let run_status = if exhausted { STATUS_DLQ } else { STATUS_FAIL };
+    let detail = if exhausted {
+        format!(
+            "{}; attempt {}/{} exhausted; moved to DLQ",
+            detail,
+            attempt,
+            max_attempts.max(1)
+        )
+    } else {
+        format!(
+            "{}; attempt {}/{} failed; retry queued in {}s",
+            detail,
+            attempt,
+            max_attempts.max(1),
+            DEFAULT_RETRY_DELAY_SECS
+        )
+    };
+    let run_id = record_run(state, &job.id, now, run_status, &detail).await;
+    if let Err(e) = state.store.touch_job(&job.id, now, run_status).await {
         tracing::warn!(job = %job.id, error = %e, "touch_job failed after fire");
     }
 
-    if status == STATUS_FAIL {
-        tracing::warn!(job = %job.id, detail = %detail, "cron job fire failed");
+    if exhausted {
+        tracing::warn!(job = %job.id, detail = %detail, "cron job moved to DLQ");
         state.audit.emit(AuditEvent::warning(
-            "tempo.job.fail",
+            "tempo.job.dlq",
             "scheduler",
             &job.name,
             &detail,
         ));
-        klaxon_notify(state, &format!("Cron job failed: {}", job.name), &detail).await;
+        klaxon_notify(
+            state,
+            &format!("Cron job dead-lettered: {}", job.name),
+            &detail,
+        )
+        .await;
     } else {
-        tracing::info!(job = %job.id, "cron job fired ok");
+        let source = if source_run_id.is_empty() {
+            run_id.clone()
+        } else {
+            source_run_id.to_string()
+        };
+        let retry = Retry {
+            id: format!("retry_{}", random_alnum(20)),
+            job_id: job.id.clone(),
+            source_run_id: source,
+            attempt: attempt + 1,
+            max_attempts: max_attempts.max(1),
+            due_at: now + DEFAULT_RETRY_DELAY_SECS,
+            created_at: now,
+        };
+        if let Err(e) = state.store.enqueue_retry(&retry).await {
+            tracing::warn!(job = %job.id, error = %e, "enqueue_retry failed");
+        }
+        tracing::warn!(job = %job.id, retry = %retry.id, detail = %detail, "cron job retry queued");
+        state.audit.emit(AuditEvent::warning(
+            "tempo.job.retry",
+            "scheduler",
+            &job.name,
+            &detail,
+        ));
     }
 }
 
@@ -103,10 +214,7 @@ async fn check_heartbeat(state: &AppState, job: &Job, heartbeats: &[Heartbeat], 
 
     if !alive && job.last_status != STATUS_DOWN {
         let silent_for = now.saturating_sub(hb.last_beat_at);
-        let detail = format!(
-            "no heartbeat for {silent_for}s (grace {}s)",
-            job.grace_secs
-        );
+        let detail = format!("no heartbeat for {silent_for}s (grace {}s)", job.grace_secs);
         record_run(state, &job.id, now, STATUS_DOWN, &detail).await;
         if let Err(e) = state.store.touch_job(&job.id, now, STATUS_DOWN).await {
             tracing::warn!(job = %job.id, error = %e, "touch_job failed on heartbeat miss");
@@ -136,9 +244,16 @@ async fn check_heartbeat(state: &AppState, job: &Job, heartbeats: &[Heartbeat], 
 }
 
 /// Append a run row (best-effort: a failed insert only warns — it never aborts the sweep).
-async fn record_run(state: &AppState, job_id: &str, started_at: i64, status: &str, detail: &str) {
+async fn record_run(
+    state: &AppState,
+    job_id: &str,
+    started_at: i64,
+    status: &str,
+    detail: &str,
+) -> String {
+    let id = format!("run_{}", random_alnum(20));
     let run = Run {
-        id: format!("run_{}", random_alnum(20)),
+        id: id.clone(),
         job_id: job_id.to_string(),
         started_at,
         status: status.to_string(),
@@ -146,6 +261,15 @@ async fn record_run(state: &AppState, job_id: &str, started_at: i64, status: &st
     };
     if let Err(e) = state.store.insert_run(&run).await {
         tracing::warn!(job = %job_id, error = %e, "insert_run failed");
+    }
+    id
+}
+
+fn attempt_detail(detail: &str, attempt: i64, max_attempts: i64) -> String {
+    if max_attempts <= 1 {
+        detail.to_string()
+    } else {
+        format!("{detail}; attempt {attempt}/{max_attempts}")
     }
 }
 
