@@ -1,0 +1,109 @@
+/* Tempo service surface, layered after Odyssey canonical CSS. */
+
+/* Bridge: define only the helper token the canonical Odyssey layer lacks.
+   Canonical wins for every shared token (--accent/--bg/--surface/--ink/--ring/
+   --ok*/--warn*/--down*/--sh-*/--radius*), so those are NOT redefined here. */
+:root {
+  --accent-border: var(--accent-soft-2);
+}
+
+.page-console { background: var(--bg); }
+
+/* App-bar right-side helpers rendered by Tempo's userbox(). */
+.allapps {
+  display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px;
+  border: 1px solid var(--border-2); border-radius: 8px; background: var(--surface);
+  font-size: 12.5px; font-weight: 500; color: var(--ink-2);
+}
+.allapps:hover { background: var(--bg-2); color: var(--ink); }
+.allapps svg { width: 14px; height: 14px; opacity: .8; }
+.userchip { display: inline-flex; align-items: center; gap: 8px; padding-left: 4px; }
+.userchip__avatar {
+  width: 28px; height: 28px; border-radius: 8px; flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--accent); color: #fff; font-weight: 600; font-size: 12px;
+}
+.user-email { font-size: 13px; color: var(--ink-2); font-weight: 500; }
+@media (max-width: 640px) { .user-email, .topbar__title { display: none; } }
+
+/* Brand product pill (the "Tempo" lockup chip). */
+.brand__product {
+  font-size: 12px; font-weight: 600; letter-spacing: .01em;
+  color: var(--accent-2); background: var(--accent-soft);
+  border: 1px solid var(--accent-border); border-radius: 999px; padding: 2px 10px;
+}
+
+/* Stacked cards keep a gap (the canonical card has no adjacency margin). */
+.card + .card { margin-top: 20px; }
+
+/* Inline code chips inside job URLs / run hashes. */
+.job-item__url code, .log__hash code {
+  font-family: var(--mono); font-size: 12.5px; color: var(--accent-2);
+  background: var(--accent-soft); border: 1px solid var(--accent-border);
+  border-radius: var(--radius-sm); padding: 1px 6px;
+}
+
+/* The "Alerting" KPI turns red (down) rather than the canonical amber warn hue. */
+.stat__val--warn { color: var(--down-ink); }
+
+/* Job list. */
+.job-list { list-style: none; margin: 0; padding: 0; }
+.job-item { display: flex; flex-direction: column; gap: 8px; padding: 16px 0; border-top: 1px solid var(--border); }
+.job-item:first-child { border-top: 0; }
+.job-item--empty { color: var(--ink-3); font-size: 13px; }
+.job-item__head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.job-item__name { font-size: 14px; font-weight: 600; color: var(--ink); }
+.job-item__line { font-size: 13px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--ink-2); }
+.job-item__url { font-size: 12px; color: var(--ink-3); word-break: break-all; }
+.job-item__actions { display: flex; gap: 8px; margin-top: 2px; }
+
+/* Badges (kind / state / status) — soft tints, hairline borders. Tempo keeps
+   these flat 6px chips uniform across all three families, so .state-badge is
+   restyled here on top of the canonical pill. */
+.state-badge, .kind-badge, .status-badge {
+  display: inline-flex; align-items: center; font-size: 11.5px; font-weight: 550;
+  padding: 2px 8px; border-radius: 6px; border: 1px solid transparent;
+}
+.state-badge--open { background: var(--ok-soft); color: var(--ok-ink); border-color: var(--ok-border); }
+.state-badge--closed { background: var(--surface-2); color: var(--ink-3); border-color: var(--border-2); }
+.kind-badge--cron { background: var(--accent-soft); color: var(--accent-2); border-color: var(--accent-border); }
+.kind-badge--hb { background: var(--warn-soft); color: var(--warn-ink); border-color: var(--warn-border); }
+.status-badge--ok { background: var(--ok-soft); color: var(--ok-ink); border-color: var(--ok-border); }
+.status-badge--down { background: var(--down-soft); color: var(--down-ink); border-color: var(--down-border); }
+.status-badge--wait { background: var(--surface-2); color: var(--ink-3); border-color: var(--border-2); }
+
+/* Inline toggle/delete form. */
+.inline-form { margin: 0; display: inline-flex; }
+
+/* Run-log table. */
+.log-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.log-table thead th {
+  text-align: left; font-size: 11.5px; font-weight: 600; color: var(--ink-3);
+  letter-spacing: .02em; padding: 11px 16px; border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.log-table tbody td { padding: 12px 16px; border-top: 1px solid var(--border); vertical-align: middle; color: var(--ink-2); }
+.log-table tbody tr:first-child td { border-top: 0; }
+.log-table tbody tr:hover { background: var(--surface-2); }
+.log__when { color: var(--ink-3); font-size: 12px; white-space: nowrap; }
+.log__detail { color: var(--ink-2); word-break: break-word; }
+.log__hash code { font-size: 11.5px; }
+.log-empty { padding: 24px; color: var(--ink-3); font-size: 13px; text-align: center; }
+
+/* Run-history filter + prev/next pager. This .pager is Tempo's flex button bar
+   (prev/next .btn spans), not the canonical numbered pager, so it fully owns the
+   .pager surface here; margin-top:0 cancels the canonical base's top margin. */
+.run-filter { align-items: center; gap: 8px; }
+.run-filter select { width: auto; min-width: 116px; padding: 7px 10px; font-size: 13px; }
+.pager {
+  display: flex; align-items: center; justify-content: flex-end; gap: 10px;
+  margin-top: 0; padding: 12px 16px; border-top: 1px solid var(--border); background: var(--surface);
+}
+.btn-disabled { opacity: .5; cursor: default; pointer-events: none; }
+
+/* Error / message page. */
+.status-code { font-size: 40px; font-weight: 600; letter-spacing: -.02em; color: var(--accent); font-family: var(--mono); }
+.message-heading { margin: 8px 0; font-size: 20px; font-weight: 600; color: var(--ink); }
+.message-body { margin: 0 0 24px; color: var(--ink-2); }
+
+@media (max-width: 640px) { .log__hash { display: none; } }

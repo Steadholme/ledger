@@ -14,6 +14,8 @@ name = "tempo"
 path = "src/main.rs"
 
 [dependencies]
+# Vendored Odyssey canonical CSS (font + tokens + shared components) for server-rendered pages.
+odyssey = { path = "../odyssey" }
 # HTTP framework (shared with keystone/relay/loom/cellar/sanctum): State/Path/Query/Form extractors,
 # server-rendered HTML for the SSO console, a plain-text public heartbeat endpoint.
 axum = "0.8"

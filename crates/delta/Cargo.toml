@@ -14,6 +14,8 @@ name = "delta"
 path = "src/main.rs"
 
 [dependencies]
+# Vendored Odyssey canonical CSS (font + tokens + shared components) for server-rendered pages.
+odyssey = { path = "../odyssey" }
 # HTTP framework (shared with keystone/relay/inkwell): State/Path/Query/Json extractors, typed responses.
 axum = "0.8"
 # Async runtime axum runs on. The Store trait is async: handlers `.await` it directly and
