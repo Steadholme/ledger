@@ -1,4 +1,4 @@
-//! Tempo — durable cron scheduler, dead-man heartbeats, and synthetic pings for the HOLDFAST stack.
+//! Tempo — durable cron scheduler, dead-man heartbeats, and synthetic pings for the Steadholme stack.
 //!
 //! Library root: defines [`AppState`], wires the routes via [`app`], and provides
 //! [`build_dev_state`] (in-memory store, no Klaxon, audit off) and [`build_state_from_env`]

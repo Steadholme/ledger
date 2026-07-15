@@ -1,4 +1,4 @@
-//! Delta — durable, offset-addressed event log / lightweight message queue for the HOLDFAST stack.
+//! Delta — durable, offset-addressed event log / lightweight message queue for the Steadholme stack.
 //!
 //! Library root: defines [`AppState`], wires the routes via [`app`], and provides
 //! [`build_dev_state`] (in-memory store, audit off) and [`build_state_from_env`] (env-selected

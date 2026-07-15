@@ -1,6 +1,6 @@
 # Delta — durable event log / lightweight message queue
 
-Delta is the HOLDFAST event spine: one append-only, offset-addressed event log on Postgres that
+Delta is the Steadholme event spine: one append-only, offset-addressed event log on Postgres that
 replaces Kafka / Redis-streams. Producers append, consumers poll by offset, durable + replayable +
 at-least-once.
 

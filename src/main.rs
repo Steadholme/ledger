@@ -1,4 +1,4 @@
-//! Ledger — one container hosting the HOLDFAST data surfaces (events / jobs).
+//! Ledger — one container hosting the Steadholme data surfaces (events / jobs).
 //!
 //! Each surface is its OWN library crate (Delta/Tempo), reused verbatim: same schema, same routes,
 //! same templates, same OWN database, same subdomain, same background work. This binary only adds a

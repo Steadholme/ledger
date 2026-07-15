@@ -270,7 +270,7 @@ async fn console_renders_streams_and_escapes() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let html = body_string(resp).await;
-    assert!(html.contains("HOLDFAST"));
+    assert!(html.contains("Steadholme"));
     assert!(html.contains("orders"));
     assert!(html.contains("ops@w33d.xyz"));
     // The payload metacharacters are escaped, never injected raw.

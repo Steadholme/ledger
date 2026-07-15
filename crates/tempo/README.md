@@ -1,6 +1,6 @@
 # Tempo
 
-Durable **cron on owned metal** for the HOLDFAST estate: scheduled HTTP pings/webhooks and
+Durable **cron on owned metal** for the Steadholme estate: scheduled HTTP pings/webhooks and
 Healthchecks-style **dead-man heartbeats** for external cron jobs. Built on `axum` + a background
 `tokio` scheduler loop, with the same async `Store` seam (in-memory default + portable PostgreSQL)
 as the rest of the estate.

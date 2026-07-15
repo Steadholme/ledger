@@ -2,7 +2,7 @@
 name = "ledger"
 version = "0.1.0"
 edition = "2021"
-description = "Ledger — one deployable hosting the HOLDFAST data surfaces (events / jobs) behind a Host-based vhost demux, served on BOTH the events port (:9150) and the jobs port (:9160) so the existing internal addresses keep working. Each surface keeps its own database, routes, subdomain and background work; this binary just composes the two library crates so the estate runs one container instead of two. Ark (backup god-credential) is intentionally NOT included."
+description = "Ledger — one deployable hosting the Steadholme data surfaces (events / jobs) behind a Host-based vhost demux, served on BOTH the events port (:9150) and the jobs port (:9160) so the existing internal addresses keep working. Each surface keeps its own database, routes, subdomain and background work; this binary just composes the two library crates so the estate runs one container instead of two. Ark (backup god-credential) is intentionally NOT included."
 license = "MIT OR Apache-2.0"
 
 [[bin]]
