@@ -68,8 +68,12 @@ async fn main() {
 
     // Each surface connects to its OWN database and migrates idempotently — exactly what the
     // standalone service did. A failure here is fatal (the surface cannot serve without its DB).
-    let events = build_events().await.unwrap_or_else(|e| fatal("events (delta)", e));
-    let jobs = build_jobs().await.unwrap_or_else(|e| fatal("jobs (tempo)", e));
+    let events = build_events()
+        .await
+        .unwrap_or_else(|e| fatal("events (delta)", e));
+    let jobs = build_jobs()
+        .await
+        .unwrap_or_else(|e| fatal("jobs (tempo)", e));
 
     let app = Router::new()
         // Host-agnostic liveness for the container HEALTHCHECK + estate probes (answers on both ports).
@@ -78,9 +82,7 @@ async fn main() {
         .with_state(Vhosts { events, jobs });
 
     let primary: SocketAddr = bind_primary.parse().expect("invalid BIND_ADDR");
-    let secondary: SocketAddr = bind_secondary
-        .parse()
-        .expect("invalid BIND_ADDR_SECONDARY");
+    let secondary: SocketAddr = bind_secondary.parse().expect("invalid BIND_ADDR_SECONDARY");
 
     let l_primary = tokio::net::TcpListener::bind(primary)
         .await
@@ -94,7 +96,9 @@ async fn main() {
     // Serve the SAME demux router on both ports. Either task ending is fatal.
     let app_secondary = app.clone();
     let primary_task = tokio::spawn(async move {
-        axum::serve(l_primary, app).await.expect("primary server error");
+        axum::serve(l_primary, app)
+            .await
+            .expect("primary server error");
     });
     let secondary_task = tokio::spawn(async move {
         axum::serve(l_secondary, app_secondary)
@@ -187,7 +191,9 @@ async fn build_jobs() -> Result<Router, String> {
     let config = tempo::config::Config::from_env();
     match &config.klaxon {
         Some(k) => tracing::info!(url = %k.url, "tempo klaxon notify enabled"),
-        None => tracing::info!("tempo klaxon notify disabled (KLAXON_URL/_INGEST_TOKEN/_NOTIFY_EMAIL unset)"),
+        None => tracing::info!(
+            "tempo klaxon notify disabled (KLAXON_URL/_INGEST_TOKEN/_NOTIFY_EMAIL unset)"
+        ),
     }
     let state = tempo::AppState {
         config: Arc::new(config),
@@ -200,7 +206,10 @@ async fn build_jobs() -> Result<Router, String> {
     // standalone Tempo ran it alongside its HTTP server (`tokio::spawn(scheduler::run(state))`); spawn
     // it here so the jobs surface keeps its periodic work.
     tokio::spawn(tempo::scheduler::run(state.clone()));
-    tracing::info!(tick_secs = state.config.tick_secs, "tempo scheduler started");
+    tracing::info!(
+        tick_secs = state.config.tick_secs,
+        "tempo scheduler started"
+    );
 
     Ok(tempo::app(state))
 }

@@ -16,7 +16,12 @@
 
 use std::sync::Arc;
 
-use delta::store::{PgStore, Store};
+use delta::store::{PgStore, Store, StoreError};
+use sha2::{Digest, Sha256};
+
+fn payload_hash(payload: &str) -> String {
+    hex::encode(Sha256::digest(payload.as_bytes()))
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pg_store_full_integration() {
@@ -38,17 +43,40 @@ async fn pg_store_full_integration() {
 
     // --- append allocates monotonic global seq -----------------------------
     let a = pg
-        .append("orders", "k1", "p1", 100)
+        .append("orders", "k1", "evt-pg-1", &payload_hash("p1"), "p1", 100)
         .await
         .expect("append a");
-    let b = pg.append("billing", "", "p2", 101).await.expect("append b");
+    let b = pg
+        .append("billing", "", "evt-pg-2", &payload_hash("p2"), "p2", 101)
+        .await
+        .expect("append b");
     let c = pg
-        .append("orders", "k3", "p3", 102)
+        .append("orders", "k3", "evt-pg-3", &payload_hash("p3"), "p3", 102)
         .await
         .expect("append c");
     assert_eq!((a.seq, b.seq, c.seq), (1, 2, 3));
     assert_eq!(pg.head_seq("orders").await, 3);
     assert_eq!(pg.head_seq("billing").await, 2);
+
+    // --- event identity replay is stable and conflicting evidence is closed -
+    let replay = pg
+        .append("orders", "k1", "evt-pg-1", &payload_hash("p1"), "p1", 103)
+        .await
+        .expect("same event/hash replay");
+    assert_eq!(replay.seq, a.seq);
+    assert!(matches!(
+        pg.append(
+            "orders",
+            "k1",
+            "evt-pg-1",
+            &payload_hash("changed"),
+            "changed",
+            104,
+        )
+        .await,
+        Err(StoreError::Conflict)
+    ));
+    assert_eq!(pg.head_seq("orders").await, 3);
 
     // --- durable read by offset, filtered per stream -----------------------
     let got = pg.read_after("orders", 0, 100).await;
@@ -68,6 +96,12 @@ async fn pg_store_full_integration() {
     pg.commit_cursor("worker-1", "orders", 3, 210)
         .await
         .expect("commit 2");
+    let repeated = pg
+        .commit_cursor("worker-1", "orders", 1, 220)
+        .await
+        .expect("older commit is an idempotent no-op");
+    assert_eq!(repeated.offset_seq, 3);
+    assert_eq!(repeated.updated_at, 210);
     let cur = pg.get_cursor("worker-1", "orders").await.expect("cursor");
     assert_eq!(cur.offset_seq, 3);
     assert_eq!(cur.updated_at, 210);
@@ -81,15 +115,50 @@ async fn pg_store_full_integration() {
     assert_eq!(tail.first().map(|e| e.seq), Some(3)); // newest-first
     assert_eq!(pg.list_cursors().await.len(), 1);
 
+    // --- duplicate delivery is atomic across independent service instances -
+    let race_a = PgStore::connect(&url).await.expect("connect race store a");
+    let race_b = PgStore::connect(&url).await.expect("connect race store b");
+    let race_hash = payload_hash("race-payload");
+    let (race_a, race_b) = tokio::join!(
+        race_a.append(
+            "replay-race",
+            "aggregate:1",
+            "evt-pg-race",
+            &race_hash,
+            "race-payload",
+            250,
+        ),
+        race_b.append(
+            "replay-race",
+            "aggregate:1",
+            "evt-pg-race",
+            &race_hash,
+            "race-payload",
+            251,
+        ),
+    );
+    let race_a = race_a.expect("first concurrent replay");
+    let race_b = race_b.expect("second concurrent replay");
+    assert_eq!(race_a.seq, race_b.seq);
+    assert_eq!(pg.read_after("replay-race", 0, 10).await.len(), 1);
+
     // --- concurrent appends never collide on seq ---------------------------
     let mut handles = Vec::new();
     for i in 0..32 {
         let pg = pg.clone();
         handles.push(tokio::spawn(async move {
-            pg.append("concurrent", "", &format!("p{i}"), 300 + i)
-                .await
-                .expect("concurrent append")
-                .seq
+            let payload = format!("p{i}");
+            pg.append(
+                "concurrent",
+                "",
+                &format!("evt-pg-concurrent-{i}"),
+                &payload_hash(&payload),
+                &payload,
+                300 + i,
+            )
+            .await
+            .expect("concurrent append")
+            .seq
         }));
     }
     let mut seqs = Vec::new();

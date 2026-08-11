@@ -6,7 +6,8 @@
 //! Missing/invalid tokens get a `401` JSON error envelope.
 //!
 //! Endpoints:
-//! - `POST /api/streams/{stream}/events`  `{ "key"?, "payload" }` -> `{ "seq" }` (append).
+//! - `POST /api/streams/{stream}/events`
+//!   `{ "key"?, "event_id", "payload_hash", "payload" }` -> `{ "seq" }` (idempotent append).
 //! - `GET  /api/streams/{stream}/events?after={seq}&limit={n}` -> `{ events: [...] }` (durable read).
 //! - `POST /api/cursors/{consumer}/{stream}`  `{ "offset" }` -> the committed cursor (+ head/lag).
 //! - `GET  /api/cursors/{consumer}/{stream}` -> the committed cursor (+ head/lag).
@@ -20,6 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::audit::AuditEvent;
 use crate::config::MAX_READ_LIMIT;
@@ -31,6 +33,10 @@ use crate::{now_secs, AppState};
 pub struct AppendBody {
     #[serde(default)]
     pub key: Option<String>,
+    #[serde(default)]
+    pub event_id: Option<String>,
+    #[serde(default)]
+    pub payload_hash: Option<String>,
     #[serde(default)]
     pub payload: Option<String>,
 }
@@ -95,9 +101,41 @@ pub async fn append(
         );
     }
     let key = body.key.unwrap_or_default();
+    let event_id = body.event_id.unwrap_or_default();
+    if event_id.is_empty() || event_id.len() > 256 || event_id.contains(['\n', '\r', '\0']) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "`event_id` is required and must be a safe identifier.",
+        );
+    }
+    let payload_hash = body.payload_hash.unwrap_or_default();
+    if payload_hash.len() != 64
+        || !payload_hash
+            .bytes()
+            .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+        || hex::encode(Sha256::digest(payload.as_bytes())) != payload_hash
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "`payload_hash` must be the lowercase SHA-256 of `payload`.",
+        );
+    }
 
-    let event = match state.store.append(stream, &key, &payload, now_secs()).await {
+    let event = match state
+        .store
+        .append(stream, &key, &event_id, &payload_hash, &payload, now_secs())
+        .await
+    {
         Ok(ev) => ev,
+        Err(crate::store::StoreError::Conflict) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "event_conflict",
+                "The event identity is already sealed with a different payload.",
+            )
+        }
         Err(e) => {
             tracing::error!(error = %e, stream, "append failed");
             return error_response(

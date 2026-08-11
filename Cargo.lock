@@ -217,9 +217,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "hex",
  "odyssey",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "time",

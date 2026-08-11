@@ -30,6 +30,8 @@ pub struct Event {
     pub seq: i64,
     pub stream: String,
     pub key: String,
+    pub event_id: Option<String>,
+    pub payload_hash: Option<String>,
     pub payload: String,
     pub created_at: i64,
 }
@@ -56,9 +58,18 @@ pub struct StreamStat {
 /// Storage failure surfaced to the handler layer.
 #[derive(Debug, Error)]
 pub enum StoreError {
+    /// The same event identity was already sealed with different payload evidence.
+    #[error("event identity conflicts with the sealed payload")]
+    Conflict,
     /// Backend I/O failure (mapped to a 500).
     #[error("store error: {0}")]
     Backend(String),
+}
+
+impl From<sqlx::Error> for StoreError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Backend(error.to_string())
+    }
 }
 
 /// Pluggable event-log store.
@@ -70,6 +81,8 @@ pub trait Store: Send + Sync {
         &self,
         stream: &str,
         key: &str,
+        event_id: &str,
+        payload_hash: &str,
         payload: &str,
         now: i64,
     ) -> Result<Event, StoreError>;
@@ -140,16 +153,30 @@ impl Store for InMemoryStore {
         &self,
         stream: &str,
         key: &str,
+        event_id: &str,
+        payload_hash: &str,
         payload: &str,
         now: i64,
     ) -> Result<Event, StoreError> {
         let mut events = self.events.lock().expect("events lock poisoned");
+        if let Some(existing) = events
+            .iter()
+            .find(|event| event.stream == stream && event.event_id.as_deref() == Some(event_id))
+        {
+            return if existing.payload_hash.as_deref() == Some(payload_hash) {
+                Ok(existing.clone())
+            } else {
+                Err(StoreError::Conflict)
+            };
+        }
         // Monotonic seq from the current head (the Mutex serializes the read+push).
         let seq = events.last().map(|e| e.seq + 1).unwrap_or(1);
         let event = Event {
             seq,
             stream: stream.to_string(),
             key: key.to_string(),
+            event_id: Some(event_id.to_string()),
+            payload_hash: Some(payload_hash.to_string()),
             payload: payload.to_string(),
             created_at: now,
         };
@@ -185,13 +212,24 @@ impl Store for InMemoryStore {
         now: i64,
     ) -> Result<Cursor, StoreError> {
         let mut cursors = self.cursors.lock().expect("cursors lock poisoned");
+        let key = (consumer.to_string(), stream.to_string());
+        if let Some(cursor) = cursors.get_mut(&key) {
+            // A committed cursor is a durable acknowledgement boundary. Retried
+            // or out-of-order consumers may repeat an older commit, but they must
+            // never move that boundary backward.
+            if offset_seq > cursor.offset_seq {
+                cursor.offset_seq = offset_seq;
+                cursor.updated_at = now;
+            }
+            return Ok(cursor.clone());
+        }
         let cursor = Cursor {
             consumer: consumer.to_string(),
             stream: stream.to_string(),
             offset_seq,
             updated_at: now,
         };
-        cursors.insert((consumer.to_string(), stream.to_string()), cursor.clone());
+        cursors.insert(key, cursor.clone());
         Ok(cursor)
     }
 
@@ -320,9 +358,23 @@ impl PgStore {
                  seq BIGINT PRIMARY KEY, \
                  stream TEXT NOT NULL, \
                  key TEXT NOT NULL DEFAULT '', \
+                 event_id TEXT, \
+                 payload_hash TEXT, \
                  payload TEXT NOT NULL, \
                  created_at BIGINT NOT NULL\
              )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("ALTER TABLE events ADD COLUMN IF NOT EXISTS event_id TEXT")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("ALTER TABLE events ADD COLUMN IF NOT EXISTS payload_hash TEXT")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_events_stream_event_id \
+             ON events (stream, event_id) WHERE event_id IS NOT NULL",
         )
         .execute(&self.pool)
         .await?;
@@ -349,6 +401,8 @@ impl PgStore {
             seq: row.try_get("seq")?,
             stream: row.try_get("stream")?,
             key: row.try_get("key")?,
+            event_id: row.try_get("event_id")?,
+            payload_hash: row.try_get("payload_hash")?,
             payload: row.try_get("payload")?,
             created_at: row.try_get("created_at")?,
         })
@@ -367,33 +421,85 @@ impl PgStore {
         &self,
         stream: &str,
         key: &str,
+        event_id: &str,
+        payload_hash: &str,
         payload: &str,
         now: i64,
-    ) -> Result<Event, sqlx::Error> {
+    ) -> Result<Event, StoreError> {
         let mut tx = self.pool.begin().await?;
+        if let Some(row) = sqlx::query(
+            "SELECT seq,stream,key,event_id,payload_hash,payload,created_at \
+             FROM events WHERE stream=$1 AND event_id=$2",
+        )
+        .bind(stream)
+        .bind(event_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let existing_hash: Option<String> = row.try_get("payload_hash")?;
+            if existing_hash.as_deref() != Some(payload_hash) {
+                return Err(StoreError::Conflict);
+            }
+            let event = Self::event_from_row(&row)?;
+            tx.commit().await?;
+            return Ok(event);
+        }
         // Read the current head inside the transaction (the serial guard already prevents a
         // concurrent appender in-process; the transaction bounds the read+write atomically).
         let head: Option<i64> = sqlx::query("SELECT max(seq) AS m FROM events")
             .fetch_one(&mut *tx)
             .await?
             .try_get("m")?;
-        let seq = head.unwrap_or(0) + 1;
-        sqlx::query(
-            "INSERT INTO events (seq, stream, key, payload, created_at) \
-             VALUES ($1, $2, $3, $4, $5)",
+        let seq = head
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Backend("event sequence exhausted".to_string()))?;
+        let inserted = sqlx::query(
+            "INSERT INTO events (seq,stream,key,event_id,payload_hash,payload,created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7)",
         )
         .bind(seq)
         .bind(stream)
         .bind(key)
+        .bind(event_id)
+        .bind(payload_hash)
         .bind(payload)
         .bind(now)
         .execute(&mut *tx)
-        .await?;
+        .await;
+        if let Err(error) = inserted {
+            let unique_violation = error
+                .as_database_error()
+                .and_then(|database| database.code())
+                .is_some_and(|code| code == "23505");
+            tx.rollback().await?;
+            if unique_violation {
+                if let Some(row) = sqlx::query(
+                    "SELECT seq,stream,key,event_id,payload_hash,payload,created_at \
+                     FROM events WHERE stream=$1 AND event_id=$2",
+                )
+                .bind(stream)
+                .bind(event_id)
+                .fetch_optional(&self.pool)
+                .await?
+                {
+                    let existing_hash: Option<String> = row.try_get("payload_hash")?;
+                    return if existing_hash.as_deref() == Some(payload_hash) {
+                        Ok(Self::event_from_row(&row)?)
+                    } else {
+                        Err(StoreError::Conflict)
+                    };
+                }
+            }
+            return Err(StoreError::Backend(error.to_string()));
+        }
         tx.commit().await?;
         Ok(Event {
             seq,
             stream: stream.to_string(),
             key: key.to_string(),
+            event_id: Some(event_id.to_string()),
+            payload_hash: Some(payload_hash.to_string()),
             payload: payload.to_string(),
             created_at: now,
         })
@@ -406,7 +512,7 @@ impl PgStore {
         limit: i64,
     ) -> Result<Vec<Event>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT seq, stream, key, payload, created_at \
+            "SELECT seq,stream,key,event_id,payload_hash,payload,created_at \
              FROM events WHERE stream = $1 AND seq > $2 ORDER BY seq ASC LIMIT $3",
         )
         .bind(stream)
@@ -432,20 +538,26 @@ impl PgStore {
         stream: &str,
         offset_seq: i64,
         now: i64,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<Cursor, sqlx::Error> {
+        let row = sqlx::query(
             "INSERT INTO cursors (consumer, stream, offset_seq, updated_at) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (consumer, stream) \
-             DO UPDATE SET offset_seq = EXCLUDED.offset_seq, updated_at = EXCLUDED.updated_at",
+             DO UPDATE SET \
+                 offset_seq = GREATEST(cursors.offset_seq, EXCLUDED.offset_seq), \
+                 updated_at = CASE \
+                     WHEN EXCLUDED.offset_seq > cursors.offset_seq THEN EXCLUDED.updated_at \
+                     ELSE cursors.updated_at \
+                 END \
+             RETURNING consumer, stream, offset_seq, updated_at",
         )
         .bind(consumer)
         .bind(stream)
         .bind(offset_seq)
         .bind(now)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(())
+        Self::cursor_from_row(&row)
     }
 
     async fn get_cursor_async(
@@ -489,7 +601,7 @@ impl PgStore {
 
     async fn tail_async(&self, stream: &str, limit: i64) -> Result<Vec<Event>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT seq, stream, key, payload, created_at \
+            "SELECT seq,stream,key,event_id,payload_hash,payload,created_at \
              FROM events WHERE stream = $1 ORDER BY seq DESC LIMIT $2",
         )
         .bind(stream)
@@ -509,7 +621,7 @@ impl PgStore {
     ) -> Result<Vec<Event>, sqlx::Error> {
         let pattern = like_contains_pattern(contains);
         let rows = sqlx::query(
-            "SELECT seq, stream, key, payload, created_at \
+            "SELECT seq,stream,key,event_id,payload_hash,payload,created_at \
              FROM events \
              WHERE ($1 = '' OR stream = $1) \
                AND seq > $2 \
@@ -545,6 +657,8 @@ impl Store for PgStore {
         &self,
         stream: &str,
         key: &str,
+        event_id: &str,
+        payload_hash: &str,
         payload: &str,
         now: i64,
     ) -> Result<Event, StoreError> {
@@ -552,9 +666,8 @@ impl Store for PgStore {
         // `Mutex` is held across the transaction `.await` without blocking a worker thread, and
         // reads never take it — so an append burst can never starve concurrent reads.
         let _guard = self.append_guard.lock().await;
-        self.append_async(stream, key, payload, now)
+        self.append_async(stream, key, event_id, payload_hash, payload, now)
             .await
-            .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
     async fn read_after(&self, stream: &str, after: i64, limit: i64) -> Vec<Event> {
@@ -582,13 +695,7 @@ impl Store for PgStore {
     ) -> Result<Cursor, StoreError> {
         self.commit_cursor_async(consumer, stream, offset_seq, now)
             .await
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        Ok(Cursor {
-            consumer: consumer.to_string(),
-            stream: stream.to_string(),
-            offset_seq,
-            updated_at: now,
-        })
+            .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
     async fn get_cursor(&self, consumer: &str, stream: &str) -> Option<Cursor> {
@@ -656,13 +763,34 @@ fn like_contains_pattern(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    async fn append_test(
+        store: &InMemoryStore,
+        stream: &str,
+        key: &str,
+        event_id: &str,
+        payload: &str,
+        now: i64,
+    ) -> Result<Event, StoreError> {
+        let payload_hash = hex::encode(Sha256::digest(payload.as_bytes()));
+        store
+            .append(stream, key, event_id, &payload_hash, payload, now)
+            .await
+    }
 
     #[tokio::test]
     async fn append_allocates_monotonic_seq_across_streams() {
         let s = InMemoryStore::new();
-        let a = s.append("orders", "k1", "p1", 100).await.unwrap();
-        let b = s.append("billing", "k2", "p2", 101).await.unwrap();
-        let c = s.append("orders", "", "p3", 102).await.unwrap();
+        let a = append_test(&s, "orders", "k1", "evt-1", "p1", 100)
+            .await
+            .unwrap();
+        let b = append_test(&s, "billing", "k2", "evt-2", "p2", 101)
+            .await
+            .unwrap();
+        let c = append_test(&s, "orders", "", "evt-3", "p3", 102)
+            .await
+            .unwrap();
         assert_eq!((a.seq, b.seq, c.seq), (1, 2, 3));
         assert_eq!(s.head_seq("orders").await, 3);
         assert_eq!(s.head_seq("billing").await, 2);
@@ -672,9 +800,15 @@ mod tests {
     #[tokio::test]
     async fn read_after_filters_by_stream_and_offset() {
         let s = InMemoryStore::new();
-        s.append("orders", "", "p1", 1).await.unwrap();
-        s.append("billing", "", "x", 1).await.unwrap();
-        s.append("orders", "", "p2", 1).await.unwrap();
+        append_test(&s, "orders", "", "evt-read-1", "p1", 1)
+            .await
+            .unwrap();
+        append_test(&s, "billing", "", "evt-read-2", "x", 1)
+            .await
+            .unwrap();
+        append_test(&s, "orders", "", "evt-read-3", "p2", 1)
+            .await
+            .unwrap();
         let got = s.read_after("orders", 0, 100).await;
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].seq, 1);
@@ -690,13 +824,13 @@ mod tests {
     #[tokio::test]
     async fn query_events_filters_by_stream_key_payload_and_offset() {
         let s = InMemoryStore::new();
-        s.append("orders", "created", "alice paid", 1)
+        append_test(&s, "orders", "created", "evt-query-1", "alice paid", 1)
             .await
             .unwrap();
-        s.append("orders", "updated", "bob refunded", 2)
+        append_test(&s, "orders", "updated", "evt-query-2", "bob refunded", 2)
             .await
             .unwrap();
-        s.append("billing", "created", "alice invoice", 3)
+        append_test(&s, "billing", "created", "evt-query-3", "alice invoice", 3)
             .await
             .unwrap();
 
@@ -715,11 +849,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cursor_commit_is_idempotent_upsert() {
+    async fn append_replay_returns_original_seq_and_hash_conflict_is_closed() {
+        let store = InMemoryStore::new();
+        let first = append_test(&store, "orders", "order:1", "evt-replay", "payload-a", 10)
+            .await
+            .unwrap();
+        let replay = append_test(&store, "orders", "order:1", "evt-replay", "payload-a", 20)
+            .await
+            .unwrap();
+        assert_eq!(replay.seq, first.seq);
+        assert_eq!(store.read_after("orders", 0, 10).await.len(), 1);
+        assert!(matches!(
+            append_test(&store, "orders", "order:1", "evt-replay", "payload-b", 30).await,
+            Err(StoreError::Conflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cursor_commit_is_monotonic_idempotent_upsert() {
         let s = InMemoryStore::new();
         assert!(s.get_cursor("c1", "orders").await.is_none());
         s.commit_cursor("c1", "orders", 5, 10).await.unwrap();
         s.commit_cursor("c1", "orders", 9, 20).await.unwrap();
+        let repeated = s.commit_cursor("c1", "orders", 4, 30).await.unwrap();
+        assert_eq!(repeated.offset_seq, 9);
+        assert_eq!(repeated.updated_at, 20);
         let cur = s.get_cursor("c1", "orders").await.unwrap();
         assert_eq!(cur.offset_seq, 9);
         assert_eq!(cur.updated_at, 20);
@@ -734,10 +888,17 @@ mod tests {
         for i in 0..64 {
             let s = s.clone();
             handles.push(tokio::spawn(async move {
-                s.append("orders", "", &format!("p{i}"), i as i64)
-                    .await
-                    .unwrap()
-                    .seq
+                append_test(
+                    &s,
+                    "orders",
+                    "",
+                    &format!("evt-concurrent-{i}"),
+                    &format!("p{i}"),
+                    i as i64,
+                )
+                .await
+                .unwrap()
+                .seq
             }));
         }
         let mut seqs = Vec::new();

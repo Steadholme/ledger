@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use delta::config::DEFAULT_SERVICE_TOKEN;
 use delta::{app, build_dev_state};
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 const TOKEN: &str = DEFAULT_SERVICE_TOKEN;
@@ -21,6 +22,16 @@ async fn body_string(resp: axum::response::Response) -> String {
 
 fn json_of(s: &str) -> serde_json::Value {
     serde_json::from_str(s).unwrap()
+}
+
+fn append_body(key: Option<&str>, event_id: &str, payload: &str) -> String {
+    serde_json::json!({
+        "key": key,
+        "event_id": event_id,
+        "payload_hash": hex::encode(Sha256::digest(payload.as_bytes())),
+        "payload": payload
+    })
+    .to_string()
 }
 
 #[tokio::test]
@@ -67,14 +78,21 @@ async fn append_then_read_by_offset() {
     let app = app(build_dev_state());
 
     // Append three events to two streams.
-    for (stream, payload) in [("orders", "a"), ("orders", "b"), ("billing", "c")] {
+    for (index, (stream, payload)) in [("orders", "a"), ("orders", "b"), ("billing", "c")]
+        .into_iter()
+        .enumerate()
+    {
         let resp = app
             .clone()
             .oneshot(
                 Request::post(format!("/api/streams/{stream}/events"))
                     .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(format!(r#"{{"payload":"{payload}"}}"#)))
+                    .body(Body::from(append_body(
+                        None,
+                        &format!("evt-append-{index}"),
+                        payload,
+                    )))
                     .unwrap(),
             )
             .await
@@ -122,19 +140,24 @@ async fn append_then_read_by_offset() {
 async fn read_filters_by_key_and_payload_fragment() {
     let app = app(build_dev_state());
 
-    for (key, payload) in [
+    for (index, (key, payload)) in [
         ("created", "alice paid"),
         ("updated", "bob refunded"),
         ("created", "alice shipped"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let resp = app
             .clone()
             .oneshot(
                 Request::post("/api/streams/orders/events")
                     .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(format!(
-                        r#"{{"key":"{key}","payload":"{payload}"}}"#
+                    .body(Body::from(append_body(
+                        Some(key),
+                        &format!("evt-query-{index}"),
+                        payload,
                     )))
                     .unwrap(),
             )
@@ -176,6 +199,64 @@ async fn append_rejects_empty_payload() {
 }
 
 #[tokio::test]
+async fn append_replay_returns_original_seq_and_hash_conflict_is_409() {
+    let app = app(build_dev_state());
+    let first = app
+        .clone()
+        .oneshot(
+            Request::post("/api/streams/orders/events")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(append_body(
+                    Some("order:1"),
+                    "evt-replay",
+                    "payload-a",
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_seq = json_of(&body_string(first).await)["seq"].clone();
+
+    let replay = app
+        .clone()
+        .oneshot(
+            Request::post("/api/streams/orders/events")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(append_body(
+                    Some("order:1"),
+                    "evt-replay",
+                    "payload-a",
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(json_of(&body_string(replay).await)["seq"], first_seq);
+
+    let conflict = app
+        .oneshot(
+            Request::post("/api/streams/orders/events")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(append_body(
+                    Some("order:1"),
+                    "evt-replay",
+                    "payload-b",
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let conflict = json_of(&body_string(conflict).await);
+    assert_eq!(conflict["error"]["type"], "event_conflict");
+}
+
+#[tokio::test]
 async fn cursor_commit_read_and_lag() {
     let app = app(build_dev_state());
 
@@ -186,7 +267,11 @@ async fn cursor_commit_read_and_lag() {
                 Request::post("/api/streams/orders/events")
                     .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(format!(r#"{{"payload":"e{i}"}}"#)))
+                    .body(Body::from(append_body(
+                        None,
+                        &format!("evt-cursor-{i}"),
+                        &format!("e{i}"),
+                    )))
                     .unwrap(),
             )
             .await
@@ -226,6 +311,24 @@ async fn cursor_commit_read_and_lag() {
     assert_eq!(v["offset"], 3);
     assert_eq!(v["lag"], 2);
 
+    // An out-of-order retry cannot move the durable acknowledgement backward,
+    // and the response reports the effective cursor rather than the stale input.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/cursors/worker-1/orders")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"offset":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_of(&body_string(resp).await);
+    assert_eq!(v["offset"], 3);
+    assert_eq!(v["lag"], 2);
+
     // Re-read confirms the durable commit.
     let resp = app
         .clone()
@@ -252,7 +355,11 @@ async fn console_renders_streams_and_escapes() {
             Request::post("/api/streams/orders/events")
                 .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"payload":"<script>x</script>"}"#))
+                .body(Body::from(append_body(
+                    None,
+                    "evt-console",
+                    "<script>x</script>",
+                )))
                 .unwrap(),
         )
         .await
