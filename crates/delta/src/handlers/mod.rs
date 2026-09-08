@@ -4,7 +4,7 @@
 //! - [`console`] — the SSO web console: streams list + per-stream tail + consumer cursors + lag.
 //! - [`api`] — the producer/consumer event-log API (`/api/...`) with Delta's OWN bearer auth.
 //!
-//! The shared design tokens / CSS are embedded (via `include_str!`) and inlined into every console
+//! The shared design tokens / CSS are embedded and served as one immutable stylesheet for every
 //! page, matching the Steadholme enterprise brand. All operator-supplied text (stream names, keys,
 //! payloads) is HTML-escaped on render — the console injects NO raw HTML.
 
@@ -12,17 +12,17 @@ pub mod api;
 pub mod console;
 pub mod health;
 
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use std::sync::OnceLock;
 
 /// Delta-only CSS layered after Odyssey's canonical font, tokens, and components.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
+pub const APP_CSS_PATH: &str = "/assets/delta-20260908.css";
 
 static APP_CSS: OnceLock<String> = OnceLock::new();
 
-/// Embedded design system (Odyssey canonical CSS + Delta service CSS), inlined into
-/// each rendered page's `<style>`.
+/// Embedded design system (Odyssey canonical CSS + Delta service CSS).
 pub fn app_css() -> &'static str {
     APP_CSS
         .get_or_init(|| {
@@ -34,8 +34,23 @@ pub fn app_css() -> &'static str {
         .as_str()
 }
 
-/// The Steadholme shield glyph (small, for the app-bar brand lockup).
-pub const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="hf-shield-sm" x1="8" y1="4" x2="40" y2="44" gradientUnits="userSpaceOnUse"><stop stop-color="#818CF8"/><stop offset="1" stop-color="#4F46E5"/></linearGradient></defs><path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" fill="url(#hf-shield-sm)"/><rect x="20" y="19" width="8" height="13" rx="1" fill="#fff" fill-opacity="0.92"/><path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="#fff" stroke-width="2" stroke-opacity="0.92" fill="none"/></svg>"##;
+pub async fn app_css_asset() -> Response {
+    let mut response = app_css().into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
 
 /// Cross-subdomain SSO logout (terminated at the Keystone IdP behind the gateway).
 pub const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
@@ -69,14 +84,98 @@ pub fn truncate(s: &str, n: usize) -> String {
     out
 }
 
-/// Render the shared HTML page shell with the app-bar. `title` is the app-bar page label, `email`
-/// the signed-in identity (shown when known), `body` the already-escaped main content HTML.
-pub fn page(title: &str, email: Option<&str>, body: &str) -> String {
+/// Icons used across the console chrome (inline so no asset request is needed).
+pub const ICON_MARK: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/></svg>"##;
+pub const ICON_GRID: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>"##;
+
+/// The console pages, in app-bar order.
+pub const NAV: [(&str, &str); 2] = [("/", "Streams"), ("https://jobs.w33d.xyz/", "Tempo")];
+
+/// Render the app bar: brand lockup + host + page pills; All apps, identity and Log out.
+pub fn app_bar(active: &str, email: Option<&str>) -> String {
+    let mut pills = String::new();
+    for (href, label) in NAV {
+        pills.push_str(&format!(
+            r#"<a class="surf{state}" href="{href}"{aria}>{label}</a>"#,
+            state = if href == active { " is-active" } else { "" },
+            href = href,
+            aria = if href == active {
+                r#" aria-current="page""#
+            } else {
+                ""
+            },
+            label = label,
+        ));
+    }
+    let chip = match email {
+        Some(value) if !value.is_empty() && value != "—" => {
+            let initial = value
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_else(|| "S".to_string());
+            format!(
+                r#"<span class="userchip"><span class="userchip__avatar" aria-hidden="true">{initial}</span><span class="user-email">{email}</span></span>"#,
+                initial = esc(&initial),
+                email = esc(value),
+            )
+        }
+        _ => {
+            r#"<span class="user-email user-email--none">— (no gateway session)</span>"#.to_string()
+        }
+    };
+    format!(
+        r#"<header class="suitebar">
+  <a class="suitebar__brand" href="/">
+    <span class="brand-tile" aria-hidden="true">{mark}</span>
+    <span class="suitebar__name"><b>Steadholme</b><span>Ledger · Delta</span></span>
+  </a>
+  <span class="suitebar__host">events.w33d.xyz</span>
+  <nav class="surfaces" aria-label="Delta pages">{pills}</nav>
+  <span class="suitebar__spacer"></span>
+  <div class="suitebar__right">
+    <a class="allapps" href="https://w33d.xyz">{grid}<span>All apps</span></a>
+    {chip}
+    <a class="btn btn-ghost btn-sm" href="{logout}">Log out</a>
+  </div>
+</header>"#,
+        mark = ICON_MARK,
+        pills = pills,
+        grid = ICON_GRID,
+        chip = chip,
+        logout = LOGOUT_URL,
+    )
+}
+
+/// The shared page footer.
+pub const FOOTER: &str = r##"<footer class="v2-foot">
+  <span class="v2-foot__lead">Steadholme · Ledger · events.w33d.xyz</span>
+  <a href="https://events.w33d.xyz">Delta</a>
+  <a href="https://jobs.w33d.xyz">Tempo</a>
+  <a href="https://audit.w33d.xyz">Watchtower</a>
+  <a href="https://status.w33d.xyz">Status</a>
+  <a href="https://w33d.xyz">All apps</a>
+</footer>"##;
+
+/// Resolve the viewer's theme from the cookie header.
+pub fn theme_of(headers: &axum::http::HeaderMap) -> &'static str {
+    odyssey::resolve_theme(
+        headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+/// Render the shared HTML page shell: theme attributes, the app bar with `active` marked, the
+/// body, and the footer. `body` is already-escaped main content HTML.
+pub fn page(title: &str, active: &str, theme: &str, email: Option<&str>, body: &str) -> String {
     PAGE_HTML
-        .replace("{{CSS}}", app_css())
-        .replace("{{SHIELD}}", SHIELD_SVG)
+        .replace("{{THEME_ATTR}}", odyssey::html_theme_attr(theme))
+        .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
+        .replace("{{CSS_PATH}}", APP_CSS_PATH)
         .replace("{{TITLE}}", &esc(title))
-        .replace("{{USERBOX}}", &userbox(title, email))
+        .replace("{{APPBAR}}", &app_bar(active, email))
+        .replace("{{FOOTER}}", FOOTER)
         .replace("{{BODY}}", body)
 }
 
@@ -85,44 +184,7 @@ pub fn html(body: String) -> Response {
     (StatusCode::OK, Html(body)).into_response()
 }
 
-/// The right side of the app-bar: the page title, an "All apps" link back to the apex portal, the
-/// signed-in identity chip (avatar initial + email, when known), and the cross-subdomain logout
-/// link. Shared by every page so the chrome stays identical across the estate.
-pub fn userbox(title: &str, email: Option<&str>) -> String {
-    // A user chip (avatar initial + email) is shown only when a gateway identity is known; the
-    // "All apps" pill and logout complete the shared app-bar chrome on every page.
-    let chip = match email {
-        Some(e) if !e.is_empty() => {
-            let initial = e
-                .chars()
-                .next()
-                .map(|c| c.to_uppercase().to_string())
-                .unwrap_or_else(|| "H".to_string());
-            format!(
-                "<span class=\"userchip\"><span class=\"userchip__avatar\" aria-hidden=\"true\">{}</span><span class=\"user-email\">{}</span></span>",
-                esc(&initial),
-                esc(e),
-            )
-        }
-        _ => String::new(),
-    };
-    format!(
-        concat!(
-            "<span class=\"topbar__title\">{title}</span>",
-            "<a class=\"allapps\" href=\"https://w33d.xyz\" title=\"All apps\">",
-            "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">",
-            "<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/>",
-            "<rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/></svg>All apps</a>",
-            "{chip}",
-            "<a class=\"btn btn-ghost btn-sm\" href=\"{LOGOUT_URL}\">Log out</a>",
-        ),
-        title = esc(title),
-        chip = chip,
-        LOGOUT_URL = LOGOUT_URL,
-    )
-}
-
-/// Render the branded error page (used by [`crate::error::AppError`]).
+/// Render the branded error page as one status tile.
 pub fn render_error(
     status: StatusCode,
     heading: &str,
@@ -130,9 +192,11 @@ pub fn render_error(
     email: Option<&str>,
 ) -> (StatusCode, Html<String>) {
     let body = ERROR_HTML
-        .replace("{{CSS}}", app_css())
-        .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("Delta", email))
+        .replace("{{THEME_ATTR}}", "")
+        .replace("{{COLOR_SCHEME}}", "light dark")
+        .replace("{{CSS_PATH}}", APP_CSS_PATH)
+        .replace("{{APPBAR}}", &app_bar("/", email))
+        .replace("{{FOOTER}}", FOOTER)
         .replace("{{STATUS}}", &status.as_u16().to_string())
         .replace("{{HEADING}}", &esc(heading))
         .replace("{{MESSAGE}}", &esc(message));

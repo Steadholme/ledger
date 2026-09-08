@@ -45,6 +45,34 @@ async fn healthz_is_open_and_plain_ok() {
 }
 
 #[tokio::test]
+async fn stylesheet_is_public_immutable_and_typed() {
+    let response = app(build_dev_state())
+        .oneshot(
+            Request::get("/assets/delta-20260908.css")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/css; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .unwrap(),
+        "nosniff"
+    );
+}
+
+#[tokio::test]
 async fn api_requires_bearer() {
     // No Authorization header -> 401 with WWW-Authenticate.
     let resp = app(build_dev_state())
@@ -378,6 +406,8 @@ async fn console_renders_streams_and_escapes() {
     assert_eq!(resp.status(), StatusCode::OK);
     let html = body_string(resp).await;
     assert!(html.contains("Steadholme"));
+    assert!(html.contains(r#"href="/assets/delta-20260908.css""#));
+    assert!(!html.contains("<style>"));
     assert!(html.contains("orders"));
     assert!(html.contains("ops@w33d.xyz"));
     // The payload metacharacters are escaped, never injected raw.

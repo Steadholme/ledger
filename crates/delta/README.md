@@ -44,3 +44,29 @@ consumer commits the last processed `seq` as its cursor and resumes from there.
 CARGO_BUILD_JOBS=2 cargo check --all-targets
 cargo test            # database-free (in-memory); pg_store test skips without TEST_DATABASE_URL
 ```
+
+## Frontend (v2, 2026-09-08)
+
+The console follows the shared Steadholme v2 system implemented from the Figma
+file `ljE8aFvLz8Q0Wtd5TmdyhQ` (Ledger, cobalt accent). `/assets/delta-20260908.css`
+is `crates/odyssey`'s canonical layer, then this crate's `static/service.css`;
+bump the date in `src/handlers/mod.rs` and in the tests together when the CSS
+changes.
+
+Every page renders through `page(title, active, theme, email, body)`, which
+fills the theme attributes, the stylesheet, the footer and the app bar — the app
+bar last, so the one caller-supplied chrome value can never be re-scanned as a
+template marker. The app bar carries both Ledger surfaces, so Delta and Tempo
+cross-link from the same nav.
+
+The stylesheet adds the domain families the design calls for: job kinds (cron
+cobalt, heartbeat teal), the violet stream-key chip, the lag bar with its value
+beside it, and the dark log surface shared by payload blocks and ping strips.
+That surface stays dark in both themes, because it reads as a terminal.
+
+Vocabulary follows the estate rule that every visible string is a name, a value
+or an action. The intro paragraphs are gone: the titles name the pages and the
+scheduler sweep interval is stated as a value.
+
+`src/bin/delta_fixture.rs` serves the console from the in-memory store with no
+database and no egress.

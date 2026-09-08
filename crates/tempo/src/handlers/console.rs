@@ -5,6 +5,7 @@
 //! shared estate-wide schedule (no per-user ownership in the data model). Every POST is double-submit
 //! CSRF protected; all producer-supplied text is HTML-escaped on render.
 
+use crate::handlers::theme_of;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
@@ -58,7 +59,6 @@ pub async fn index(
     let run_page = q.page.unwrap_or(1).max(1);
     let body = build_dashboard(
         &state,
-        &who,
         &csrf,
         edit_job.as_ref(),
         None,
@@ -68,7 +68,7 @@ pub async fn index(
     .await;
     html_with_csrf(
         StatusCode::OK,
-        page("Tempo", Some(&who.email), &body),
+        page("Jobs", "/", theme_of(&headers), Some(&who.email), &body),
         &csrf,
     )
 }
@@ -382,7 +382,6 @@ pub async fn replay_run(
 
 async fn build_dashboard(
     state: &AppState,
-    who: &Identity,
     csrf: &str,
     edit_job: Option<&Job>,
     _banner: Option<&str>,
@@ -408,8 +407,8 @@ async fn build_dashboard(
 
     format!(
         r##"<div class="console__head">
-  <h1>Tempo</h1>
-  <p class="sub">Durable cron on owned metal for {email}: scheduled HTTP pings/webhooks and Healthchecks-style dead-man heartbeats. The scheduler sweeps every {tick}s.</p>
+  <h1>Jobs</h1>
+  <p class="sub">Scheduler sweep every {tick}s</p>
 </div>
 {stat_grid}
 <div class="layout">
@@ -427,7 +426,6 @@ async fn build_dashboard(
     {form}
   </div>
 </div>"##,
-        email = esc(&who.email),
         tick = state.config.tick_secs,
         stat_grid = stat_grid,
         run_filter = render_run_filter(run_status),

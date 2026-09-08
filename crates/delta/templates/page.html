@@ -1,26 +1,17 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en"{{THEME_ATTR}}>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="{{COLOR_SCHEME}}">
   <title>{{TITLE}} · Delta · Steadholme</title>
-  <style>{{CSS}}</style>
+  <link rel="stylesheet" href="{{CSS_PATH}}">
 </head>
-<body class="page-console">
-  <header class="topbar">
-    <div class="topbar__inner">
-      <a class="brand" href="/" aria-label="Steadholme Delta">
-        <span class="brand__glyph" aria-hidden="true">{{SHIELD}}</span>
-        <span class="brand__word">Steadholme</span>
-        <span class="brand__product">Delta</span>
-      </a>
-      <div class="topbar__right">{{USERBOX}}</div>
-    </div>
-  </header>
-
-  <main class="console">
-    {{BODY}}
-  </main>
+<body class="page-v2">
+{{APPBAR}}
+<main class="v2-page">
+{{BODY}}
+{{FOOTER}}
+</main>
 </body>
 </html>

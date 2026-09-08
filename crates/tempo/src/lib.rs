@@ -57,6 +57,7 @@ pub struct AppState {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
+        .route(handlers::APP_CSS_PATH, get(handlers::app_css_asset))
         // --- SSO web console ---
         .route("/", get(handlers::console::index))
         .route("/api/jobs", post(handlers::console::save_job))

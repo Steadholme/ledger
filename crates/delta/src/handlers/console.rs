@@ -8,6 +8,7 @@
 //! All operator-supplied text (stream names, routing keys, payloads) is HTML-escaped on render, and
 //! payloads are truncated to a compact preview — the console injects NO raw HTML.
 
+use crate::handlers::theme_of;
 use std::collections::HashMap;
 
 use axum::extract::{Query, State};
@@ -93,13 +94,18 @@ pub async fn index(
     // Consumer cursors + lag.
     body.push_str(&render_cursors(&cursors, &heads));
 
-    html(page("Delta", email.as_deref(), &body))
+    html(page(
+        "Streams",
+        "/",
+        theme_of(&headers),
+        email.as_deref(),
+        &body,
+    ))
 }
 
 fn render_header() -> String {
     r#"<div class="console__head">
-  <h1>Event spine</h1>
-  <p class="sub">Durable, offset-addressed append-only log. Producers append; consumers poll by offset and commit a durable cursor.</p>
+  <h1>Streams</h1>
 </div>"#
         .to_string()
 }

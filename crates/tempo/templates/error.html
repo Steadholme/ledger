@@ -1,33 +1,27 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en"{{THEME_ATTR}}>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="{{COLOR_SCHEME}}">
   <title>{{STATUS}} · Tempo · Steadholme</title>
-  <style>{{CSS}}</style>
+  <link rel="stylesheet" href="{{CSS_PATH}}">
 </head>
-<body class="page-console">
-  <header class="topbar">
-    <div class="topbar__inner">
-      <a class="brand" href="/" aria-label="Steadholme Tempo">
-        <span class="brand__glyph" aria-hidden="true">{{SHIELD}}</span>
-        <span class="brand__word">Steadholme</span>
-        <span class="brand__product">Tempo</span>
-      </a>
-      <div class="topbar__right">{{USERBOX}}</div>
-    </div>
-  </header>
-
-  <main class="console">
-    <section class="card card--message">
-      <div class="card__body">
-        <div class="status-code">{{STATUS}}</div>
-        <h1 class="message-heading">{{HEADING}}</h1>
-        <p class="message-body">{{MESSAGE}}</p>
-        <a class="btn btn-primary" href="/">Back to Tempo</a>
+<body class="page-v2">
+{{APPBAR}}
+<main class="v2-page">
+  <div class="status-wrap">
+    <div class="status-tile">
+      <div class="status-tile__code">{{STATUS}}</div>
+      <h1 class="status-tile__heading">{{HEADING}}</h1>
+      <p class="status-tile__detail">{{MESSAGE}}</p>
+      <div class="tags">
+        <a class="btn btn-primary" href="/">Back to the jobs</a>
+        <a class="btn btn-secondary" href="https://w33d.xyz">All apps</a>
       </div>
-    </section>
-  </main>
+    </div>
+  </div>
+{{FOOTER}}
+</main>
 </body>
 </html>
